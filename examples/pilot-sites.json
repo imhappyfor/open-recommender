@@ -1,0 +1,22 @@
+[
+  {
+    "site_id": "open-news-demo",
+    "site_name": "Open News Demo",
+    "allowed_scopes": [
+      "profile.read",
+      "topics.public",
+      "consent.summary"
+    ],
+    "allow_selective_topics": true
+  },
+  {
+    "site_id": "partner-news-demo",
+    "site_name": "Partner News Demo",
+    "allowed_scopes": [
+      "profile.read",
+      "topics.public",
+      "consent.summary"
+    ],
+    "allow_selective_topics": true
+  }
+]

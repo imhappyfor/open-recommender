@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SQLite databases (runtime data — never commit)
+*.db
+*.db-shm
+*.db-wal
+
+# ORF profile and key files (never commit private keys or personal profiles)
+*.orf
+*.orf.key
+*.orfb
+
+# Demo artifacts (may contain real private keys)
+.demo-day/
+
+# Copilot agent session state
+.agents/
+
+# macOS
+.DS_Store
