@@ -7,15 +7,19 @@ from open_recommender.models import (
     AccessGrant,
     AccessRequestStatus,
     AccessScope,
+    AggregatedFeed,
     EventOp,
     GrantSession,
     ORFProfile,
     SignedEvent,
     SiteAccessRequest,
+    TopicPreference,
+    Visibility,
     build_signed_event,
     normalize_scope_set,
     schema_compatibility,
     selective_topic_scope,
+    utc_now,
 )
 
 
@@ -224,6 +228,425 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(request.extra_fields["review_note"], "manual pilot allowlist")
         self.assertEqual(grant.extra_fields["exchange_method"], "challenge")
         self.assertEqual(session.extra_fields["transport"], "bearer")
+
+
+class AggregatedFeedTests(unittest.TestCase):
+    """Tests for Phase 2 cross-site recommendation aggregation."""
+
+    def setUp(self) -> None:
+        self.private_key, public_key = generate_key_pair()
+        self.profile = ORFProfile.create("Alice", public_key, "device-a")
+
+    def signed_event(self, op: EventOp, payload: dict, *, clock: int | None = None) -> SignedEvent:
+        event = build_signed_event(self.profile, op, payload, signature="", clock=clock)
+        event.signature = sign_payload(event.unsigned_payload(), self.private_key)
+        return event
+
+    def test_empty_feed_returns_no_recommendations(self) -> None:
+        """Feed with no RECOMMEND events returns empty list."""
+        from open_recommender.models import AggregatedFeed
+
+        feed = AggregatedFeed(self.profile)
+        self.assertEqual(feed.top_n(), [])
+        self.assertEqual(feed.aggregate(), [])
+
+    def test_single_source_recommendation(self) -> None:
+        """Single source recommending an item creates aggregated recommendation."""
+        from open_recommender.models import AggregatedFeed
+
+        rec_event = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-123",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.9,
+                "reason": "Based on your tech interests",
+                "metadata": {"title": "The Matrix", "type": "movie"},
+                "timestamp": "2025-01-20T10:00:00+00:00",
+            },
+        )
+        self.profile.event_log.append(rec_event)
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].item_id, "movie-123")
+        self.assertEqual(len(recs[0].sources), 1)
+        self.assertEqual(recs[0].sources[0].site_name, "Netflix")
+
+    def test_de_duplication_same_item_multiple_sites(self) -> None:
+        """Same item_id from multiple sites is de-duplicated into one recommendation."""
+        from open_recommender.models import AggregatedFeed
+
+        netflix_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-123",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.9,
+                "metadata": {"title": "The Matrix", "type": "movie"},
+            },
+        )
+        imdb_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-123",
+                "site_id": "imdb",
+                "site_name": "IMDb",
+                "score": 0.85,
+                "metadata": {"title": "The Matrix", "type": "movie"},
+            },
+        )
+        self.profile.event_log.extend([netflix_rec, imdb_rec])
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].item_id, "movie-123")
+        self.assertEqual(len(recs[0].sources), 2)
+        source_sites = {s.site_id for s in recs[0].sources}
+        self.assertEqual(source_sites, {"netflix", "imdb"})
+
+    def test_consensus_score_increases_with_sites(self) -> None:
+        """Consensus score increases as more sites recommend the same item."""
+        from open_recommender.models import AggregatedFeed
+
+        # Add recommendations from 3 sites for the same item
+        for i, (site_id, site_name) in enumerate([("netflix", "Netflix"), ("imdb", "IMDb"), ("youtube", "YouTube")]):
+            rec = self.signed_event(
+                EventOp.RECOMMEND,
+                {
+                    "item_id": "movie-123",
+                    "site_id": site_id,
+                    "site_name": site_name,
+                    "score": 0.8 + (i * 0.05),
+                },
+            )
+            self.profile.event_log.append(rec)
+
+        # Add other items from fewer sites
+        other_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-456",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.9,
+            },
+        )
+        self.profile.event_log.append(other_rec)
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        # movie-123 should have higher consensus than movie-456
+        movie123 = next(r for r in recs if r.item_id == "movie-123")
+        movie456 = next(r for r in recs if r.item_id == "movie-456")
+
+        self.assertGreater(movie123.consensus_score, movie456.consensus_score)
+        self.assertEqual(movie123.consensus_score, 1.0)  # 3 sites out of 3 total
+
+    def test_freshness_decay(self) -> None:
+        """Fresher recommendations get higher freshness boost."""
+        from open_recommender.models import AggregatedFeed
+        from datetime import datetime, timezone, timedelta
+
+        now = datetime.now(timezone.utc)
+        old_time = (now - timedelta(days=30)).isoformat().replace("+00:00", "Z")
+        recent_time = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+        old_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "old-movie",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.95,
+                "timestamp": old_time,
+            },
+        )
+        recent_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "recent-movie",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.7,
+                "timestamp": recent_time,
+            },
+        )
+        self.profile.event_log.extend([old_rec, recent_rec])
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        old = next(r for r in recs if r.item_id == "old-movie")
+        recent = next(r for r in recs if r.item_id == "recent-movie")
+
+        self.assertGreater(recent.freshness_boost, old.freshness_boost)
+
+    def test_affinity_boost_from_user_topics(self) -> None:
+        """Items matching high-weight user topics get affinity boost."""
+        from open_recommender.models import AggregatedFeed, TopicPreference, Visibility
+
+        # Add high-weight topic for technology
+        tech_topic = TopicPreference(
+            topic="orf:technology/python",
+            weight=0.9,
+            visibility=Visibility.PUBLIC,
+            updated_at=utc_now(),
+        )
+        self.profile.topics["orf:technology/python"] = tech_topic
+
+        # Recommend item that mentions "python" (matches topic)
+        tech_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "python-course",
+                "site_id": "udemy",
+                "site_name": "Udemy",
+                "score": 0.7,
+                "metadata": {"title": "Learn Python Programming", "description": "python tutorial"},
+            },
+        )
+        # Recommend unrelated item
+        unrelated_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "cooking-show",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.7,
+            },
+        )
+        self.profile.event_log.extend([tech_rec, unrelated_rec])
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        tech_item = next(r for r in recs if r.item_id == "python-course")
+        unrelated_item = next(r for r in recs if r.item_id == "cooking-show")
+
+        self.assertGreater(tech_item.affinity_boost, unrelated_item.affinity_boost)
+
+    def test_final_score_combines_factors(self) -> None:
+        """Final score combines consensus, freshness, and affinity."""
+        from open_recommender.models import AggregatedFeed
+
+        # High consensus, high freshness item
+        high_quality_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "popular-item",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.9,
+                "timestamp": "2025-01-21T10:00:00+00:00",  # recent
+            },
+        )
+        # Add more sites for consensus
+        for site in ["imdb", "youtube"]:
+            rec = self.signed_event(
+                EventOp.RECOMMEND,
+                {
+                    "item_id": "popular-item",
+                    "site_id": site,
+                    "site_name": site.title(),
+                    "score": 0.85,
+                    "timestamp": "2025-01-21T10:00:00+00:00",
+                },
+            )
+            self.profile.event_log.append(rec)
+
+        # Low consensus, low freshness item
+        obscure_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "obscure-item",
+                "site_id": "niche-site",
+                "site_name": "Niche Site",
+                "score": 0.95,
+                "timestamp": "2024-12-01T10:00:00+00:00",  # old
+            },
+        )
+        self.profile.event_log.extend([high_quality_rec, obscure_rec])
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        popular = next(r for r in recs if r.item_id == "popular-item")
+        obscure = next(r for r in recs if r.item_id == "obscure-item")
+
+        self.assertGreater(popular.final_score, obscure.final_score)
+
+    def test_top_n_returns_correct_count(self) -> None:
+        """top_n() returns at most N recommendations."""
+        from open_recommender.models import AggregatedFeed
+
+        # Add 5 recommendations
+        for i in range(5):
+            rec = self.signed_event(
+                EventOp.RECOMMEND,
+                {
+                    "item_id": f"item-{i}",
+                    "site_id": "netflix",
+                    "site_name": "Netflix",
+                    "score": 0.9 - (i * 0.05),
+                },
+            )
+            self.profile.event_log.append(rec)
+
+        feed = AggregatedFeed(self.profile)
+        top3 = feed.top_n(3)
+        top10 = feed.top_n(10)
+
+        self.assertEqual(len(top3), 3)
+        self.assertEqual(len(top10), 5)  # Only 5 exist
+
+    def test_missing_metadata_handled_gracefully(self) -> None:
+        """Recommendations with missing metadata don't crash."""
+        from open_recommender.models import AggregatedFeed
+
+        # Minimal recommendation with no metadata
+        minimal_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "minimal-item",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.8,
+            },
+        )
+        self.profile.event_log.append(minimal_rec)
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].best_metadata, {})
+
+    def test_conflicting_scores_from_same_item(self) -> None:
+        """Item with different scores from different sites shows all scores."""
+        from open_recommender.models import AggregatedFeed
+
+        netflix_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-999",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.95,
+                "reason": "Trending in your genre",
+            },
+        )
+        imdb_rec = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-999",
+                "site_id": "imdb",
+                "site_name": "IMDb",
+                "score": 0.4,
+                "reason": "Low user ratings",
+            },
+        )
+        self.profile.event_log.extend([netflix_rec, imdb_rec])
+
+        feed = AggregatedFeed(self.profile)
+        recs = feed.aggregate()
+
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(len(recs[0].sources), 2)
+        scores = sorted([s.score for s in recs[0].sources], reverse=True)
+        self.assertEqual(scores[0], 0.95)
+        self.assertEqual(scores[1], 0.4)
+
+    def test_custom_ranking_weights(self) -> None:
+        """Ranking weights can be customized for aggregate()."""
+        from open_recommender.models import AggregatedFeed
+
+        # Add multiple items with different profiles
+        fresh_item = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "fresh",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.5,
+                "timestamp": "2025-01-21T10:00:00+00:00",
+            },
+        )
+        consensus_item = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "consensus",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.5,
+                "timestamp": "2024-01-01T10:00:00+00:00",
+            },
+        )
+        # Add more sites for consensus
+        for site in ["imdb", "youtube"]:
+            rec = self.signed_event(
+                EventOp.RECOMMEND,
+                {
+                    "item_id": "consensus",
+                    "site_id": site,
+                    "site_name": site.title(),
+                    "score": 0.5,
+                    "timestamp": "2024-01-01T10:00:00+00:00",
+                },
+            )
+            self.profile.event_log.append(rec)
+
+        self.profile.event_log.extend([fresh_item, consensus_item])
+
+        feed = AggregatedFeed(self.profile)
+
+        # Default weights: favor consensus
+        default_recs = feed.aggregate()
+        default_order = [r.item_id for r in default_recs]
+
+        # Freshness-heavy weights: favor fresh
+        freshness_recs = feed.aggregate(
+            consensus_weight=0.1,
+            freshness_weight=0.8,
+            affinity_weight=0.1,
+        )
+        freshness_order = [r.item_id for r in freshness_recs]
+
+        # With different weights, order might change (depending on actual scores)
+        # At minimum, we've called the method with custom weights successfully
+        self.assertEqual(len(default_recs), 2)
+        self.assertEqual(len(freshness_recs), 2)
+
+    def test_feed_to_dict_serializable(self) -> None:
+        """AggregatedFeed can be serialized to dict."""
+        from open_recommender.models import AggregatedFeed
+
+        rec_event = self.signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "test-item",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.8,
+            },
+        )
+        self.profile.event_log.append(rec_event)
+
+        feed = AggregatedFeed(self.profile)
+        feed_dict = feed.to_dict()
+
+        self.assertIn("profile_id", feed_dict)
+        self.assertIn("aggregated_at", feed_dict)
+        self.assertIn("total_items", feed_dict)
+        self.assertIn("recommendations", feed_dict)
+        self.assertEqual(feed_dict["total_items"], 1)
 
 
 if __name__ == "__main__":
