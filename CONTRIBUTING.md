@@ -80,21 +80,8 @@ Please keep docs aligned with actual behavior.
 
 ## Tests and behavior changes
 
-The repo includes project-local instructions in `.github/instructions/testing.instructions.md`. In practice, contributors should:
+The repo includes project-local testing guidance. In practice, contributors should:
 
 - add or update tests whenever behavior changes under `src/open_recommender/`
 - prefer `unittest`
 - focus especially on serialization, signature verification, privacy boundaries, sync merge semantics, API challenge flow, and CLI workflows
-
-## Project-local Copilot setup
-
-This repository also contains project-local Copilot configuration:
-
-- `.github/agents/avery.agent.yaml`
-- `.github/skills/`
-- `.agents/skills/`
-- `.github/instructions/`
-
-`.github/skills/` is the authored source for the repo's specialist skills. `.agents/skills/` mirrors those definitions so Copilot CLI skill discovery can pick them up reliably.
-
-These files are contributor tooling, not runtime product code. If you change developer workflows or contributor guidance in a meaningful way, update them when needed so the local agent and skill setup stays accurate.

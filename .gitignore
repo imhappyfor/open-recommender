@@ -33,6 +33,9 @@ htmlcov/
 # Demo artifacts (may contain real private keys)
 .demo-day/
 
+# Private strategy notes
+private/
+
 # Copilot agent session state
 .agents/
 

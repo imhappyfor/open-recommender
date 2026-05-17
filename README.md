@@ -306,26 +306,13 @@ curl -H "X-Open-Recommender-Admin-Token: dev-admin-token" \
 
 These endpoints are meant for local and pilot investigation, not end-user access.
 
-## Early market fit
-
-The current product fit is narrow on purpose. This repo is best suited today for:
-
-- privacy-conscious early adopters who want to inspect and carry a portable interest profile
-- small pilot sites that want a cold-start personalization demo without building a full account system first
-- developer-led partners evaluating a user-controlled alternative to closed recommendation onboarding
-
-It is **not** yet the right fit for mainstream consumer login replacement, large-scale ad-tech integrations, or polished non-technical onboarding.
-
 ## Repository layout
 
 ```text
 src/open_recommender/   Core package, CLI, models, API, and SQLite store
 tests/                  unittest coverage for models and service flows
 docs/                   Deeper contributor and architecture documentation
-.github/agents/         Project-local agent definitions
-.github/skills/         Project-local skill source files
-.agents/skills/         Runtime-compatible mirror for skill discovery
-.github/instructions/   Extra contributor/agent instructions
+examples/               Reference flows and pilot examples
 ```
 
 ## Read more
@@ -334,6 +321,7 @@ docs/                   Deeper contributor and architecture documentation
 - [Local proof-of-concept testing](docs/local-poc-testing.md)
 - [Pilot integration flow](docs/pilot-integration.md)
 - [Architecture](docs/architecture.md)
-- [Phase 2 productization brief](docs/phase-2-productization.md)
-- [Product roadmap](docs/product-roadmap.md)
+- [Phase 2 cross-site feed](docs/phase-2-cross-site-feed.md)
+- [Phase 2 integration guide](docs/phase-2-integration-guide.md)
+- [Transparency and security](docs/transparency-and-security.md)
 - [Contributing](CONTRIBUTING.md)

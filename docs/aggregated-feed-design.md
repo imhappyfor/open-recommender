@@ -269,9 +269,8 @@ Examples:
    - **Scores:** Keep all individual scores, never average (show conflicts transparently)
 
 5. **Filter out near-duplicates (optional anti-spam):**
-   - Items with the same title but different external_id (e.g., same movie on Netflix & IMDb with different IDs)
-   - For MVP: **don't do fuzzy matching**—rely on sites having correct IDs
-   - Future: edit-distance threshold or ISBN/IMDB lookups
+    - Items with the same title but different external_id (e.g., same movie on Netflix & IMDb with different IDs)
+    - For MVP: **don't do fuzzy matching**—rely on sites having correct IDs
 
 ### Why This Approach?
 
@@ -390,43 +389,35 @@ Items with only 1 recommendation source (new to the feed, niche items).
 
 ---
 
-## 6. Known Limitations & Future Work
+## 6. Known Limitations
 
 ### Limitations of This Design
 
 1. **No Trend Detection**
    - Doesn't detect "suddenly popular" items (spike in recommendations in last 24h)
    - All freshness is time-only decay, not velocity
-   - **Future:** Add a "momentum" factor: `(new_sources_in_last_7_days / total_sources)`
 
 2. **No Site Trustworthiness**
    - All sources weighted equally (if one site is spam-heavy, can't downweight it)
-   - **Future:** Site reputation score (user ratings, complaint counts from admin panel)
 
 3. **No User Engagement Signal**
    - Doesn't consider "has user clicked this recommendation before?"
-   - **Future:** If feed backs up "click" events, use click-through rate as affinity signal
 
 4. **Topic Matching is Shallow**
    - Simple `tag in topics` check, no semantic similarity
    - "Horror" won't match a user who likes "suspense"
-   - **Future:** Word embeddings or ontology (IMDb genres → ORF namespace mapping)
 
 5. **No Filtering by Genre/Type**
    - Feed includes movies, podcasts, articles mixed together
-   - **Future:** `feed.filter(entity_types=["movie", "podcast"])`
 
 6. **No Multi-Context Support**
    - Doesn't handle "work mode vs. weekend mode" contexts
-   - **Future:** Collections/curated sub-feeds (Phase 2.5)
 
 7. **Score Range Handling**
    - Assumes all sources use 0-10 scale; sites might use 0-5 or 0-100
-   - **Future:** Request standard score range in recommendation event schema, or auto-normalize
 
 8. **No Caching**
    - Every `feed.aggregate()` call re-processes entire event log
-   - **Future:** Incremental aggregation (track last processed event, only new ones)
 
 ---
 

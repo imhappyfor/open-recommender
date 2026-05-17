@@ -2,8 +2,6 @@
 
 **Phase goal:** Prove that portability is not overhead—it is the competitive advantage. Users come back daily because the feed proves the `.orf` format delivers value.
 
-**Timeline:** 4-6 weeks (implementation) + 1-2 weeks (pilot validation).
-
 **Definition of done:** At least one pilot site integrates; users see a unified feed aggregating recommendations from 2+ platforms; retention metrics show daily-active-user improvement over baseline.
 
 ---
@@ -127,40 +125,6 @@ A **cross-site recommendation feed** that aggregates, de-duplicates, and ranks r
 
 ---
 
-### ⭐ Future (Post-v1): Collections & Curation
-
-**Description:** Users create "mood-based" or "context-based" sub-feeds (e.g., "weekend chill," "work focus," "family safe").
-
-**Acceptance criteria:** Not in Phase 2 scope.
-
-**Why it's valuable:** Solves multi-context households and devices. Feed becomes even more personalized.
-
-**Estimated effort:** 2-3 weeks (Phase 2.5)
-
----
-
-## Sequencing & Dependencies
-
-```
-Week 1-2: Core aggregation + tests
-    ↓
-Week 3: CLI dashboard + integration template
-    ↓
-Week 4: Pilot site integration + validation
-    ↓
-Week 5-6: Metrics + fixes + hardening
-```
-
-**Blockers:**
-- None. This builds on top of existing event sync infrastructure.
-
-**Pilot sites:**
-- Need at least 1 partner to integrate and validate (e.g., indie music discovery, niche news site).
-- They should implement the site integration template.
-- We measure: users active daily with feed? Retention improvement? Recommendation quality?
-
----
-
 ## Success Criteria
 
 ### User-level:
@@ -176,7 +140,6 @@ Week 5-6: Metrics + fixes + hardening
 ### Business-level:
 - [ ] First pilot site goes live (proves adoption interest)
 - [ ] Recommendation quality is better than single-site baseline (if we have metrics)
-- [ ] Story for Phase 3 (narratives + investor pitch) has live demo
 
 ---
 
@@ -209,25 +172,3 @@ Week 5-6: Metrics + fixes + hardening
 - Privacy review: use `critique-privacy-paranoid` on the metadata exposure
 
 ---
-
-## Open Questions
-
-1. **What do we rank by besides consensus + freshness?** Candidate signals: user preference affinity (topics), item recency, site trustworthiness (don't boost from spam sites), user's past engagement with that site's recommendations.
-
-2. **How do we avoid cold-start for new sites?** If a user just synced a site with zero events, the feed will be sparse. Answer: fall back to single-site personalization from the site itself; the feed just layers additional signal.
-
-3. **How do we handle recommendation conflicts?** If Netflix suggests a movie as a 9/10 and another site suggests it as 3/10, how do we resolve? Answer: show both scores, let the UI decide to average or show the range.
-
-4. **Should the feed sync back to the service?** No, initially. Feed is generated locally. Future: users could opt-in to backing up their "feed clicks" (which recommendations they followed) to improve cold-start.
-
----
-
-## Next Step
-
-When approved, we will:
-1. Spec out the aggregation algorithm in detail (ranking weights, de-duplication rules)
-2. Implement core aggregation + tests
-3. Reach out to 2-3 potential pilot sites for parallel integration
-4. Ship an MVP dashboard (CLI first) by week 4
-
-The feed is the bridge between portability (technical promise) and delight (user experience). It answers "why should I bother?" with "because you get better recommendations without the friction of separate apps."
