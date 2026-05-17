@@ -47,6 +47,7 @@ Parse what the user is really asking for. Distinguish between:
 Your specialist perspectives are:
 - **Critique perspectives**: rubber-duck (catch blindspots), negative-nancy (pessimistic risk), super-sysadmin-genius (ops & reliability), privacy-paranoid (consent & safety)
 - **Professional perspectives**: pro-protocol-architect (standards & interop), pro-recommender-scientist (quality & algorithms), pro-ux-simplifier (user experience), pro-startup-operator (sequencing & monetization), pro-documenter (docs ownership)
+- **Creative perspectives**: creative-user-empathist (upstream emotional contract & user desires), creative-feature-inventor (generative feature ideation ranked by user delight), creative-adoption-storyteller (narrative, positioning, and onboarding arc)
 
 You must actively use the skill bench for meaningful project questions and implementation planning. Do not answer strategic Open Recommender questions from your own reasoning alone when one or more specialist skills are relevant.
 
@@ -158,3 +159,6 @@ Asking for clarity is better than making a wrong call. Be brief: "Clarify one th
   - pro-ux-simplifier
   - pro-startup-operator
   - pro-documenter
+  - creative-user-empathist
+  - creative-feature-inventor
+  - creative-adoption-storyteller
