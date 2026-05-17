@@ -1,8 +1,30 @@
 # Architecture
 
-This document describes the current architecture of the Open Recommender Python repository.
+Open Recommender is a portable identity and state mechanism. The `.orf` file is not just a data container—it is the **lock-and-key** that eliminates account creation friction and enables continuous, portable personalization across sites.
 
-## High-level shape
+This document describes the architecture of the Python reference implementation.
+
+## Core Promise: Portable Identity & State
+
+The `.orf` file serves three essential functions:
+
+1. **Identity lock-and-key**: Your Ed25519 key pair embedded in the `.orf` file is your unforgeable identity. Sites authenticate you by verifying you can sign a challenge with your private key. No username. No password. No account creation.
+
+2. **State container**: Your `.orf` file is the canonical source of your preference state. Sites sync with this state; they don't create their own copy. When you visit a new site, it pulls the delta (changes since last sync) and renders personalization immediately.
+
+3. **Portability substrate**: Because your identity and state live in a portable file, you carry them everywhere. Delete your account on one site, sign in on another with the same `.orf` file, and your preferences are immediately there.
+
+**The delta-sync contract:** Sites that support ORF must follow this pattern:
+- On page load, check if the user has an `.orf` file (device presence).
+- If yes, pull the delta from the user's profile (newer events since last sync timestamp).
+- Apply those events locally to re-render personalization.
+- Save the new sync timestamp to the `.orf` file (via the trust app or CLI).
+
+This contract makes "create an account" obsolete. The `.orf` file is the account.
+
+---
+
+## High-level architecture
 
 The project has four main runtime pieces:
 
@@ -160,7 +182,7 @@ The server verifies those signatures before accepting events.
 - `GET /health` — liveness check
 - `POST /profiles` — register or update a profile document
 - `GET /profiles/{profile_id}/public` — fetch the public projection
-- `GET /profiles/{profile_id}/events` — list stored events after a given clock
+- `GET /profiles/{profile_id}/events` — **list stored events after a given clock** ← Sites call this on page load to pull the delta
 - `POST /profiles/{profile_id}/events` — append verified signed events
 - `POST /profiles/{profile_id}/challenges` — mint a challenge for a known profile
 - `POST /profiles/{profile_id}/challenge-response` — verify a signature over that challenge
@@ -217,6 +239,24 @@ The current demo personalization is deterministic and simple:
 - choose up to three featured topics
 - derive placeholder recommendation records from those topics
 - fall back to a neutral starter feed when the public profile has no shareable topics
+
+---
+
+## Phase 2 Contract: Delta Sync & Continuous Personalization
+
+Open Recommender's value proposition depends on the delta-sync contract:
+
+**For every page load on a site that supports ORF:**
+
+1. **Site detects ORF presence** — check if the browser has the ORF file (via storage, device presence, or user QR scan).
+2. **Pull delta on page load** — call `GET /profiles/{profile_id}/events?after_clock={last_sync_clock}` to retrieve only events newer than the user's last sync.
+3. **Apply events locally** — replay events into an in-memory profile state. This gives the site the current preference snapshot.
+4. **Render personalization** — rank feed / recommendations using the current state.
+5. **Save sync timestamp** — update `last_sync_clock` in the user's `.orf` file (via trust app, CLI, or device-stored state).
+
+**Result:** New users signing in with their `.orf` file see personalization *immediately* (no cold start). Existing users pulling delta changes see updated personalization without lag. The `.orf` file is always in sync because the site respects the sync timestamp contract.
+
+This delta-sync loop is the key to proving that portability is not overhead—it is the competitive advantage.
 
 ## Storage model
 
