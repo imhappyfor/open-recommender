@@ -243,3 +243,63 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(restore_code, 1)
         self.assertIn("does not match the profile", restore_stderr)
+
+    def test_cli_feed_show_aggregates_recommendations(self) -> None:
+        """Feed show command displays aggregated recommendations from profile."""
+        profile_path = Path(self.temp_dir.name) / "alice.orf"
+        key_path = Path(self.temp_dir.name) / "alice.orf.key"
+        
+        # Save the profile with recommendations
+        self._signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-123",
+                "site_id": "netflix",
+                "site_name": "Netflix",
+                "score": 0.9,
+                "metadata": {"title": "The Matrix"},
+            },
+        )
+        self._signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "movie-123",
+                "site_id": "imdb",
+                "site_name": "IMDb",
+                "score": 0.85,
+                "metadata": {"title": "The Matrix"},
+            },
+        )
+        self._signed_event(
+            EventOp.RECOMMEND,
+            {
+                "item_id": "podcast-456",
+                "site_id": "spotify",
+                "site_name": "Spotify",
+                "score": 0.8,
+                "metadata": {"title": "Tech Podcast"},
+            },
+        )
+        
+        cli.save_profile(profile_path, self.profile)
+        save_private_key(key_path, self.private_key)
+        
+        # Run feed show command
+        code, stdout, stderr = self._run_local_cli(
+            "feed", "show", str(profile_path), "--top-n", "10"
+        )
+        
+        self.assertEqual(code, 0, f"CLI failed: {stderr}")
+        
+        output = json.loads(stdout)
+        self.assertEqual(output["feed_size"], 2)  # movie-123 (de-dup) + podcast-456
+        self.assertEqual(len(output["recommendations"]), 2)
+        
+        # Check that movie-123 has 2 sources (de-duplicated)
+        movie = next(r for r in output["recommendations"] if r["item_id"] == "movie-123")
+        self.assertEqual(len(movie["sources"]), 2)
+        
+        # Check that consensus score is correct for movie-123
+        # 2 unique sites out of 3 total = 2/3 ≈ 0.667
+        self.assertGreater(movie["consensus_score"], 0.6)
+        self.assertLess(movie["consensus_score"], 0.75)

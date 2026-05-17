@@ -1,0 +1,219 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                ║
+║           OPEN RECOMMENDER: AggregatedFeed CLASS DESIGN (Phase 2)              ║
+║                                                                                ║
+║                        DESIGN DOCUMENT COMPLETE                                ║
+║                   See: docs/aggregated-feed-design.md (full)                   ║
+║                                                                                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. CLASS STRUCTURE & DATA HOLDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AggregatedFeed Instance Variables:
+  • profile: ORFProfile                    (reads from event log)
+  • consensus_weight: 0.5                  (tuning parameter)
+  • freshness_weight: 0.3                  (tuning parameter)
+  • affinity_weight: 0.2                   (tuning parameter)
+  • max_sources_normalization: 5           (scale for consensus)
+  • freshness_half_life_days: 30           (time decay parameter)
+
+Core Data Types:
+  ├─ RecommendationSource
+  │  ├─ site_id: str
+  │  ├─ site_name: str
+  │  ├─ score: float [0-10]
+  │  ├─ score_source: str ("user_rating"|"algorithm"|"community")
+  │  ├─ recommended_at: str (ISO timestamp)
+  │  └─ recommendation_reason: str | None
+  │
+  ├─ AggregatedRecommendationItem
+  │  ├─ entity_key: str "<type>:<id>" (canonical de-dup key)
+  │  ├─ entity_type: str ("movie"|"song"|"article"|...)
+  │  ├─ external_id: str (site's native ID)
+  │  ├─ title, description, thumbnail_url: metadata
+  │  ├─ primary_tags: list[str] (genres/topics from source)
+  │  ├─ sources: list[RecommendationSource] (all recommenders)
+  │  ├─ weighted_score: float [0.0-1.0] (final ranking score)
+  │  ├─ consensus_factor: float [0.0-1.0]
+  │  ├─ freshness_factor: float [0.0-1.0]
+  │  ├─ affinity_factor: float [0.0-1.0]
+  │  ├─ has_conflicting_scores: bool
+  │  ├─ score_range: (min, max) tuple | None
+  │  └─ best_source: RecommendationSource (highest scorer)
+  │
+  └─ FeedAggregationMetrics (diagnostic)
+     ├─ total_events_processed: int
+     ├─ recommendation_events: int
+     ├─ unique_items_ranked: int
+     ├─ items_with_consensus: int (2+ sources)
+     ├─ cold_start_items: int (1 source)
+     └─ top_site_count: dict[site_id -> count]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. RANKING ALGORITHM (Mathematical Formula)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Final Score Calculation:
+
+  weighted_score = (consensus_factor × 0.5) 
+                 + (freshness_factor × 0.3) 
+                 + (affinity_factor × 0.2)
+
+  Result: [0.0, 1.0] — all factors normalized, sum of weights = 1.0
+
+
+A. CONSENSUS FACTOR (Multi-Site Agreement)
+────────────────────────────────────────
+
+  consensus_factor = min(num_sources / 5, 1.0)
+
+  Examples:
+    • 1 source → 1/5 = 0.20
+    • 2 sources → 2/5 = 0.40
+    • 3 sources → 3/5 = 0.60
+    • 5+ sources → 5/5 = 1.00
+
+
+B. FRESHNESS FACTOR (Exponential Time Decay)
+─────────────────────────────────────────────
+
+  freshness_factor = 0.5 ^ (age_days / 30)
+
+  Examples (30-day half-life):
+    • 0 days old → 1.00
+    • 15 days old → 0.707
+    • 30 days old → 0.50
+    • 60 days old → 0.25
+
+
+C. AFFINITY FACTOR (User Topic Preference Matching)
+──────────────────────────────────────────────────
+
+  affinity_factor = max(topic.weight for matching topics) OR 0.0
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONCRETE EXAMPLE: "The Matrix"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sources:
+  Netflix (8.5, 10 days old), IMDb (8.7, 15 days old), PodcastApp (7.2, 31 days old)
+User topics: scifi (0.85)
+
+Calculation:
+  • Consensus: 3/5 = 0.60
+  • Freshness: avg(0.787, 0.707, 0.495) = 0.663
+  • Affinity: 0.85 (matches "sci-fi")
+  • Score: (0.60 × 0.5) + (0.663 × 0.3) + (0.85 × 0.2) = 0.669
+
+Result: Strong ranking, near top of feed.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. DE-DUPLICATION LOGIC & ENTITY KEYS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Entity Key Format: "<entity_type>:<external_id>"
+
+Examples:
+  • "movie:tt0133093" (IMDb)
+  • "song:spotify:6rqhFgbbKwnb9MLmUQDvDm"
+  • "article:nytimes/2025-01-20/slug"
+
+Process:
+  1. Extract entity_type + external_id from event
+  2. Build entity_key
+  3. Group events by key
+  4. Merge metadata (union tags, first non-null description, etc.)
+  5. Keep all scores (never average)
+
+Why: Leverages existing site IDs, no external lookups, transparent conflicts.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. COLD-START HANDLING (New Items, Single Source)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Definition: Items with exactly 1 recommendation source.
+
+Strategy:
+  ✓ INCLUDE in feed (don't filter)
+  ✓ Rank by: (freshness × 0.3) + (affinity × 0.2) only
+  ✓ Max achievable score: 0.5
+  ✓ Display indicator: consensus_count == 1
+
+Rationale:
+  ✓ New discoveries valuable
+  ✓ Prevents echo chamber
+  ✓ Naturally re-ranks upward as consensus grows
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. CRITICAL TEST CASES (8 Edge Cases)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ test_dedup_exact_match
+  Same movie ID from multiple sites → 1 entry, 2 sources
+
+✓ test_rank_perfect_consensus
+  5+ sites, fresh, matches user interests → Score ≈ 1.0
+
+✓ test_rank_single_source_recent
+  1 site, 1 day old, matching topic → Score ≈ 0.2-0.5
+
+✓ test_rank_conflicting_scores
+  Netflix 9/10 vs other 2/10 → Both scores preserved, not averaged
+
+✓ test_rank_stale_no_affinity
+  1 site, 100 days old, no matches → Score ≈ 0.01
+
+✓ test_cold_start_becomes_hot
+  Item: 1 source → 2 sources → consensus jumps 0.2 → 0.4
+
+✓ test_rank_high_consensus_no_affinity
+  5 sources, no topic match → Consensus + freshness carry item
+
+✓ test_multiple_matching_topics
+  Item: [scifi, thriller], user: scifi (0.9) + thriller (0.7)
+  → affinity_factor = max(0.9) not sum
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. KNOWN LIMITATIONS (Future Work)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. No trend detection (sudden popularity)
+2. No site trustworthiness weighting
+3. No user engagement signals
+4. Topic matching shallow (no embeddings)
+5. No entity type filtering
+6. No multi-context support
+7. Assumes 0-10 score scale
+8. No incremental caching
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. IMPLEMENTATION READINESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Algorithm deterministic + auditable
+✓ De-duplication rules clear + explicit
+✓ All test cases concrete (not vague)
+✓ Entity key strategy leverages existing standards
+✓ Handles edge cases: conflicts, stale data, cold-start
+✓ Transparent scoring (shows all sources)
+✓ No external service calls (stateless, local-only)
+✓ Weights calibrated for reasonable behavior
+
+READY FOR IMPLEMENTATION ✓
+
+Files Created:
+  • docs/aggregated-feed-design.md (full design, 22K chars)
+  • AGGREGATED_FEED_DESIGN_SUMMARY.txt (this file, quick reference)
+
+Next: Code implementation in src/open_recommender/models.py
+

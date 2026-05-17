@@ -292,6 +292,27 @@ def command_backup_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_feed_show(args: argparse.Namespace) -> int:
+    """Display aggregated cross-site recommendation feed."""
+    from .models import AggregatedFeed
+
+    profile_path = Path(args.profile_path)
+    profile = load_profile(profile_path)
+    feed = AggregatedFeed(profile)
+    top_n = args.top_n if args.top_n else 20
+
+    recs = feed.top_n(top_n)
+
+    output = {
+        "profile_id": profile.profile_id,
+        "feed_size": len(recs),
+        "top_n": top_n,
+        "recommendations": [r.to_dict() for r in recs],
+    }
+    print_json(output)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="open-recommender")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -386,6 +407,14 @@ def build_parser() -> argparse.ArgumentParser:
     backup_restore_parser.add_argument("--backup-passphrase", required=True)
     backup_restore_parser.add_argument("--overwrite", action="store_true")
     backup_restore_parser.set_defaults(func=command_backup_restore)
+
+    feed_parser = subparsers.add_parser("feed")
+    feed_subparsers = feed_parser.add_subparsers(dest="feed_command", required=True)
+
+    feed_show_parser = feed_subparsers.add_parser("show")
+    feed_show_parser.add_argument("profile_path")
+    feed_show_parser.add_argument("--top-n", type=int, default=20)
+    feed_show_parser.set_defaults(func=command_feed_show)
 
     return parser
 
