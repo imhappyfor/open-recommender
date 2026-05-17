@@ -30,7 +30,33 @@ This writes:
 
 The CLI prints JSON including the generated `profile_id`.
 
-## 2. Add or remove preference state
+## 2. Inspect your profile (Trust verification)
+
+**Your `.orf` file is human-readable JSON.** You can read exactly what's stored by opening it in a text editor:
+
+```bash
+cat profile.orf | jq .
+```
+
+You'll see:
+- `profile_id` — your identity (Ed25519 public key)
+- `display_name`, `device_id` — what you set
+- `topics` — your preferences with visibility levels (`public`, `selective`, `private`)
+- `opt_outs` — topics you've removed
+- `consent` — flags like `hosted_sync`, `ad_personalization`
+- `events` — a signed log of every change (cryptographically verified)
+
+**Why this matters:** You can verify that:
+- No hidden data is stored in your profile
+- Private topics only exist locally (they're not synced or shared)
+- Every change is signed with your key (nobody can modify it without your private key)
+- The CLI isn't secretly collecting extra data
+
+This is the first trust check. If you can read your profile and understand it, you control it.
+
+See [Transparency & Security](transparency-and-security.md) for a complete explanation of what Open Recommender stores and doesn't store.
+
+## 3. Add or remove preference state
 
 Add a public topic:
 

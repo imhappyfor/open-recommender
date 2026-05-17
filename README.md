@@ -1,6 +1,15 @@
 # Open Recommender
 
-Open Recommender is an early Python implementation of portable, user-controlled recommender profiles.
+Open Recommender is an early Python implementation of portable, user-controlled recommender profiles. Your recommendation taste is yours to carry across the internet.
+
+## The Core Idea
+
+Think of your recommendation profile like a credit score — one portable, verifiable record that travels with you. Except unlike a credit score, *you own it completely*. You decide what parts are public, what stays private, and which sites get to see what.
+
+- **You own your data**: Your `.orf` profile lives on your device or a service of your choice.
+- **You control sharing**: Mark topics as public, selective, or private. Sites see only what you approve.
+- **You carry it forward**: Move to a new platform? Bring your preferences with you. No cold start. No algorithmic amnesia.
+- **It's auditable**: Open the file in a text editor. See exactly what's stored. No hidden data.
 
 Today the repository includes:
 
@@ -47,6 +56,14 @@ Add a topic and inspect the public projection:
 python -m open_recommender.cli topic-set profile.orf orf:technology/python 0.9
 python -m open_recommender.cli export-public profile.orf
 ```
+
+**Inspect your profile** — your `.orf` file is human-readable JSON:
+
+```bash
+cat profile.orf | jq .
+```
+
+You can see exactly what's stored: your identity, topics, consent flags, and the cryptographic log of all changes. See [Transparency & Security](docs/transparency-and-security.md) for details on what Open Recommender stores and what it doesn't.
 
 Create an encrypted recovery backup:
 
