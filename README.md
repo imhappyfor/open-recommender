@@ -28,7 +28,9 @@ Today the repository includes:
 
 ## What ORF means here
 
-An ORF profile is a signed JSON document that keeps user preference state local and portable. The current model stores:
+ORF stands for **Open Recommender Format**.
+
+An ORF (Open Recommender Format) profile is a signed JSON document that keeps user preference state local and portable. The current model stores:
 
 - profile identity derived from an Ed25519 public key
 - topic preferences with `public`, `selective`, or `private` visibility

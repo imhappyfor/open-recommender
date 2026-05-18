@@ -39,5 +39,8 @@ private/
 # Copilot agent session state
 .agents/
 
+# Copilot skills
+.skills/
+
 # macOS
 .DS_Store
