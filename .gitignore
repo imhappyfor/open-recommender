@@ -39,6 +39,9 @@ private/
 # Copilot agent session state
 .agents/
 
+# Local agent/skill configuration (do not publish)
+.github/
+
 # Copilot skills
 .skills/
 
@@ -48,8 +51,7 @@ private/
 # GitHub Codespaces settings
 .devcontainer/
 
-# .github
-.github/
+
 
 
 # macOS
