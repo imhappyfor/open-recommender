@@ -129,6 +129,20 @@ Example:
 - Every change is signed — if someone modifies your profile, you'll see a signature mismatch.
 - Your public topics are the only data the service can process.
 
+### Important note: `.orf` plaintext vs `.orfb` encryption
+
+Open Recommender uses two file types with different security properties:
+
+- **`.orf` (active profile):** plain-text JSON by design, so you can inspect and audit it in a text editor.
+- **`.orfb` (backup bundle):** encrypted with your backup passphrase.
+
+So the active `.orf` profile is **not encrypted JSON** today. Its protection model is:
+
+- **Integrity/authenticity:** Ed25519 signatures detect tampering.
+- **Confidentiality at rest:** provided by encrypted backups (`.orfb`), not by the live `.orf` file.
+
+**Device compromise is out of scope in the current model.** If malware or an attacker can read files on your device, they can read your `.orf` preferences (and may access key material). Open Recommender does not claim to protect data on a compromised host.
+
 ### 2. Inspect the Service's View
 
 If you sync with a hosted service, you can request your own events:
