@@ -42,5 +42,15 @@ private/
 # Copilot skills
 .skills/
 
+# VS Code settings
+.vscode/
+
+# GitHub Codespaces settings
+.devcontainer/
+
+# .github
+.github/
+
+
 # macOS
 .DS_Store
