@@ -60,6 +60,32 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(health_response.json()["status"], "ok")
         self.assertIn("service", health_response.json())
 
+    def test_local_browser_cors_allows_preflight_and_post_from_react(self) -> None:
+        origin = "http://localhost:5173"
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+        preflight_response = self.client.options(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        self.assertEqual(preflight_response.status_code, 200)
+        self.assertEqual(preflight_response.headers.get("access-control-allow-origin"), origin)
+
+        post_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            headers={"Origin": origin},
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "requested_scopes": ["profile.read"],
+            },
+        )
+        self.assertEqual(post_response.status_code, 200)
+        self.assertEqual(post_response.headers.get("access-control-allow-origin"), origin)
+
     def test_events_and_challenge_flow(self) -> None:
         self.client.post("/profiles", json={"profile": self.profile.to_document()})
         event = build_signed_event(
@@ -250,6 +276,100 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(replay_response.status_code, 400)
         self.assertIn("already been used", replay_response.json()["detail"])
+
+    def test_site_access_request_supports_required_and_optional_scopes(self) -> None:
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
+        )
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:media/podcasts", "weight": 0.7, "visibility": "selective"},
+        )
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        request_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "required_scopes": ["profile.read", "topics.public"],
+                "optional_scopes": ["topics.selective:orf:media/podcasts", "unknown.scope"],
+            },
+        )
+        self.assertEqual(request_response.status_code, 200)
+        access_request = request_response.json()["access_request"]
+        self.assertEqual(access_request["required_scopes"], ["profile.read", "topics.public"])
+        self.assertEqual(
+            access_request["optional_scopes"],
+            ["topics.selective:orf:media/podcasts"],
+        )
+        self.assertEqual(
+            access_request["requested_scopes"],
+            ["profile.read", "topics.public", "topics.selective:orf:media/podcasts"],
+        )
+        self.assertEqual(access_request["ignored_requested_scopes"], ["unknown.scope"])
+
+    def test_site_access_request_approval_requires_required_scopes(self) -> None:
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        request_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "required_scopes": ["profile.read"],
+                "optional_scopes": ["topics.public"],
+            },
+        )
+        self.assertEqual(request_response.status_code, 200)
+        request_id = request_response.json()["access_request"]["request_id"]
+
+        missing_required_response = self.client.post(
+            f"/site-access-requests/{request_id}/approve",
+            json={"approved_scopes": ["topics.public"]},
+        )
+        self.assertEqual(missing_required_response.status_code, 400)
+        self.assertIn("Required scopes cannot be removed", missing_required_response.json()["detail"])
+
+        valid_response = self.client.post(
+            f"/site-access-requests/{request_id}/approve",
+            json={"approved_scopes": ["profile.read"]},
+        )
+        self.assertEqual(valid_response.status_code, 200)
+        self.assertEqual(valid_response.json()["grant"]["approved_scopes"], ["profile.read"])
+
+    def test_site_access_verify_accepts_unpadded_base64url_signature(self) -> None:
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        request_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "requested_scopes": ["topics.public"],
+            },
+        )
+        self.assertEqual(request_response.status_code, 200)
+        request_id = request_response.json()["access_request"]["request_id"]
+
+        approve_response = self.client.post(f"/site-access-requests/{request_id}/approve")
+        self.assertEqual(approve_response.status_code, 200)
+
+        exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
+        self.assertEqual(exchange_response.status_code, 200)
+        exchange_body = exchange_response.json()
+
+        browser_style_signature = sign_payload(exchange_body["challenge_payload"], self.private_key).rstrip("=")
+        verify_response = self.client.post(
+            f"/site-access-requests/{request_id}/verify",
+            json={
+                "challenge_id": exchange_body["challenge"]["challenge_id"],
+                "signature": browser_style_signature,
+            },
+        )
+        self.assertEqual(verify_response.status_code, 200)
+        self.assertTrue(verify_response.json()["verified"])
 
     def test_site_access_request_denial_blocks_exchange(self) -> None:
         self.client.post("/profiles", json={"profile": self.profile.to_document()})
@@ -468,9 +588,11 @@ class ServiceTests(unittest.TestCase):
             json={
                 "site_id": "open-news-demo",
                 "purpose": "Personalize the pilot site feed.",
-                "requested_scopes": [
+                "required_scopes": [
                     "profile.read",
                     "topics.public",
+                ],
+                "optional_scopes": [
                     "topics.selective:orf:media/podcasts",
                 ],
             },
@@ -488,8 +610,9 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(review_response.status_code, 200)
         self.assertIn("Review site access request", review_response.text)
         self.assertIn("Open News Demo", review_response.text)
+        self.assertIn("Required to continue", review_response.text)
         self.assertIn("Technology / Python", review_response.text)
-        self.assertIn("Newly shared with this site only", review_response.text)
+        self.assertIn("Optional newly shared with this site only", review_response.text)
         token_match = re.search(r'const csrfToken = "([^"]+)"', review_response.text)
         self.assertIsNotNone(token_match)
         csrf_token = token_match.group(1)
@@ -566,6 +689,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(lens_page.status_code, 200)
         self.assertIn("Local Profile Lens", lens_page.text)
         self.assertIn("Open a local .orf file", lens_page.text)
+        self.assertIn("Register or update in local service", lens_page.text)
         self.assertIn("Review pending site requests", lens_page.text)
 
         list_response = self.client.get("/lens/profiles")
@@ -585,6 +709,108 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(pending_requests_response.status_code, 200)
         self.assertEqual(pending_requests_response.json()["requests"][0]["request_id"], request_id)
+
+    def test_profile_lens_can_import_local_profile_into_service(self) -> None:
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
+        )
+
+        import_response = self.client.post(
+            "/lens/profiles/import",
+            json={"profile": self.profile.to_document()},
+        )
+        self.assertEqual(import_response.status_code, 200)
+        self.assertEqual(
+            import_response.json()["profile"]["profile_id"],
+            self.profile.profile_id,
+        )
+        self.assertEqual(
+            import_response.json()["profile"]["topics"][0]["topic"],
+            "orf:technology/python",
+        )
+
+        list_response = self.client.get("/lens/profiles")
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.json()["profiles"][0]["profile_id"], self.profile.profile_id)
+
+        public_response = self.client.get(f"/profiles/{self.profile.profile_id}/public")
+        self.assertEqual(public_response.status_code, 200)
+        self.assertEqual(public_response.json()["profile_id"], self.profile.profile_id)
+
+    def test_consent_review_data_route_returns_json_for_browser_ui(self) -> None:
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
+        )
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:media/podcasts", "weight": 0.7, "visibility": "selective"},
+        )
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        request_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "required_scopes": ["profile.read", "topics.public"],
+                "optional_scopes": ["topics.selective:orf:media/podcasts"],
+            },
+        )
+        request_id = request_response.json()["access_request"]["request_id"]
+
+        review_data = self.client.get(f"/consent/site-access-requests/{request_id}/review-data")
+        self.assertEqual(review_data.status_code, 200)
+        body = review_data.json()
+        self.assertEqual(body["access_request"]["request_id"], request_id)
+        self.assertIn("csrf_token", body)
+        self.assertEqual(body["scope_groups"]["required"][0]["scope"], "profile.read")
+        self.assertTrue(body["scope_groups"]["required"][0]["required"])
+        self.assertEqual(
+            body["scope_groups"]["optional_newly_shared"][0]["scope"],
+            "topics.selective:orf:media/podcasts",
+        )
+        self.assertEqual(body["projection_preview"]["display_name"], "Alice")
+
+    def test_create_access_request_reuses_active_grant_for_same_purpose_and_scopes(self) -> None:
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
+        )
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        first_request = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "requested_scopes": ["profile.read", "topics.public"],
+            },
+        )
+        self.assertEqual(first_request.status_code, 200)
+        first_request_id = first_request.json()["access_request"]["request_id"]
+
+        approve_response = self.client.post(
+            f"/site-access-requests/{first_request_id}/approve",
+            json={"approved_scopes": ["profile.read", "topics.public"]},
+        )
+        self.assertEqual(approve_response.status_code, 200)
+        original_grant_id = approve_response.json()["grant"]["grant_id"]
+
+        second_request = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "requested_scopes": ["profile.read", "topics.public"],
+            },
+        )
+        self.assertEqual(second_request.status_code, 200)
+        second_body = second_request.json()
+        self.assertEqual(second_body["access_request"]["status"], "approved")
+        self.assertEqual(second_body["access_request"]["decision_actor"], "stored-grant-reuse")
+        self.assertEqual(second_body["access_request"]["reused_prior_grant_id"], original_grant_id)
 
     def test_grant_revocation_page_blocks_future_exchange_and_records_audit(self) -> None:
         admin_app = create_app(Path(self.temp_dir.name) / "revoke.db", admin_token="secret-token")

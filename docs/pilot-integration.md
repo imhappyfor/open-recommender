@@ -9,7 +9,7 @@ It is intentionally narrow:
 3. the site proves control of the portable profile through challenge signing
 4. the site receives a short-lived consented projection
 
-The current trust app exists, but the integration kit is still intentionally narrow: one stable flow, one pre-registered pilot `site_id`, and one reference example script.
+The integration kit is narrow by design: one stable flow, one pre-registered pilot `site_id`, and one reference example script.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ The current trust app exists, but the integration kit is still intentionally nar
 - you know the `profile_id`
 - the `site_id` has already been registered in the running service
 
-Today the default local service only pre-registers:
+The default local service pre-registers:
 
 - `open-news-demo`
 
@@ -37,11 +37,11 @@ The file format is a JSON array of site entries with at least:
 
 `allow_selective_topics` is optional (defaults to `false`).
 
-There is intentionally no self-serve site-registration API yet.
+There is no self-serve site-registration API.
 
-## Python partner SDK v0 (thin wrapper)
+## Python partner SDK
 
-For site-side integration code, the repo now includes `open_recommender.partner_sdk.PartnerClient`.
+For site-side integration code, the repo includes `open_recommender.partner_sdk.PartnerClient`.
 
 Supported operations:
 
@@ -171,7 +171,7 @@ Response shape:
 - `challenge`
 - `challenge_payload`
 
-`challenge_payload` is the canonical object to sign. In the current v0 service, `challenge` and `challenge_payload` contain the same data; the duplicate field is there for compatibility with the demo flow.
+`challenge_payload` is the canonical object to sign. `challenge` and `challenge_payload` contain the same data; the duplicate field is there for compatibility with the demo flow.
 
 The important handoff is:
 
@@ -215,7 +215,7 @@ Important validation rules:
 
 ## Reference integration example
 
-The repo now includes a runnable example that shows both sides of the handoff in one file:
+The repo includes a runnable example that shows both sides of the handoff in one file:
 
 ```bash
 python examples/pilot_flow.py http://127.0.0.1:8000 profile.orf --auto-approve
@@ -292,7 +292,7 @@ Current guardrails:
 - admin endpoints are disabled unless `OPEN_RECOMMENDER_ADMIN_TOKEN` is configured
 - audit records are stored for access requests, approvals, denials, challenges, grant sessions, and projection reads
 
-Current time limits:
+Time limits:
 
 | Item | Default |
 | --- | --- |
@@ -314,7 +314,7 @@ curl -s -H "X-Open-Recommender-Admin-Token: dev-admin-token" \
 
 ## 7. What this flow proves
 
-Today this pilot flow proves that Open Recommender can:
+This pilot flow proves that Open Recommender can:
 
 - let a site integrate around a stable scoped access contract
 - keep user approval explicit and portable-profile-centered
@@ -330,7 +330,7 @@ From the localhost trust app, open:
 http://127.0.0.1:8000/consent/grants
 ```
 
-Current v0 revocation behavior:
+Revocation behavior:
 
 - active grants can be revoked from the browser trust app
 - revoked grants are recorded in audit events as `grant.revoked`

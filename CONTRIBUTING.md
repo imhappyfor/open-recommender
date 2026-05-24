@@ -2,14 +2,14 @@
 
 Thanks for helping with Open Recommender.
 
-This repository is still early, so the best contributions are small, concrete, and aligned with the code that already exists.
+The best contributions are small, concrete, and aligned with the code that already exists.
 
 ## Development setup
 
 Use Python 3.10+.
 
 ```bash
-python -m pip install -e .[dev]
+python -m pip install -e '.[dev]'
 ```
 
 That installs:
@@ -77,11 +77,15 @@ Please keep docs aligned with actual behavior.
 - Update `docs/getting-started.md` for onboarding changes.
 - Update `docs/architecture.md` when changing data contracts, merge rules, sync, API behavior, or storage assumptions.
 - Do not document aspirational browser, passkey, or product flows that are not implemented yet.
+- Keep planning, roadmap, and future-work notes out of public docs; use private session artifacts instead.
 
 ## Tests and behavior changes
 
 The repo includes project-local testing guidance. In practice, contributors should:
 
-- add or update tests whenever behavior changes under `src/open_recommender/`
+- add or update tests whenever behavior changes anywhere in the repository
+- keep Python coverage under `src/open_recommender/` in `tests/`
 - prefer `unittest`
 - focus especially on serialization, signature verification, privacy boundaries, sync merge semantics, API challenge flow, and CLI workflows
+- for changes under `sdk/`, add or update the package's own unit or browser smoke tests and keep a real `test` script in `package.json`
+- run the relevant package test command for SDK/browser work (`npm test` in the affected `sdk/` package) as part of the same change

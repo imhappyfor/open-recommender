@@ -14,7 +14,7 @@ If you want a copy-pasteable proof-of-concept walkthrough with representative co
 From the repository root:
 
 ```bash
-python -m pip install -e .[dev]
+python -m pip install -e '.[dev]'
 ```
 
 ## 1. Create a local ORF profile
@@ -158,11 +158,13 @@ Useful endpoints:
 - `GET /consent`
 - `GET /consent/grants`
 - `GET /consent/site-access-requests/{request_id}`
+- `GET /consent/site-access-requests/{request_id}/review-data`
 - `POST /consent/grants/{grant_id}/revoke`
 - `POST /consent/site-access-requests/{request_id}/approve`
 - `POST /consent/site-access-requests/{request_id}/deny`
 - `GET /lens`
 - `GET /lens/profiles`
+- `POST /lens/profiles/import`
 - `GET /lens/profiles/{profile_id}`
 - `GET /lens/profiles/{profile_id}/pending-requests`
 - `GET /demo/site/{profile_id}`
@@ -205,10 +207,16 @@ http://127.0.0.1:8000/lens
 From there you can:
 
 - open a local `.orf` file directly in the browser
+- register or update that local file in the running local service with one click
 - or load a profile already registered in the local service
 - inspect what stays on this device
 - inspect what is already public
 - simulate what a site would see under selected scopes
+
+Important boundary:
+
+- opening a local file in `/lens` previews it in the browser
+- the profile is not available to `/profiles/{profile_id}/public` or the React demo until you click **Register or update in local service** or run `python -m open_recommender.cli sync-push profile.orf http://127.0.0.1:8000`
 
 Use `/consent` to review pending live site requests that need a decision:
 
@@ -244,11 +252,11 @@ The response includes:
 - `challenge`
 - `challenge_payload`
 
-Today, verification is still a low-level API step: sign `challenge_payload` with the ORF private key and post the signature to `/demo/site/<profile_id>/verify`.
+Verification is a direct API step: sign `challenge_payload` with the ORF private key and post the signature to `/demo/site/<profile_id>/verify`.
 
 ## 4c. Resolve a pilot site access request from the CLI or browser
 
-Phase 2 v0 uses a CLI reference flow because there is no browser app yet.
+The site-scoped approval flow uses a CLI reference path and a localhost trust app.
 
 First, the pilot site creates an access request against the hosted service:
 
@@ -424,10 +432,8 @@ Current tests cover:
 - backup create and restore round-trip, key-mismatch rejection
 - partner SDK happy path and error surfacing
 
-## Notes on current scope
+## Scope boundaries
 
-Document only what exists today:
-
-- there is no browser app in this repository
-- there are no passkey flows
-- challenge verification currently uses Ed25519 signatures over a server-issued challenge payload
+- Challenge verification uses Ed25519 signatures over a server-issued challenge payload.
+- There is no browser-native passkey flow.
+- The localhost trust app (`/lens` and `/consent`) only works when the service is bound to localhost.

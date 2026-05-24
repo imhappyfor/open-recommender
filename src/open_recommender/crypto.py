@@ -24,7 +24,11 @@ def encode_bytes(data: bytes) -> str:
 
 
 def decode_bytes(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data.encode("ascii"))
+    normalized = data.strip()
+    padding = (-len(normalized)) % 4
+    if padding:
+        normalized += "=" * padding
+    return base64.urlsafe_b64decode(normalized.encode("ascii"))
 
 
 def generate_key_pair() -> tuple[Ed25519PrivateKey, str]:

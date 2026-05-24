@@ -11,19 +11,21 @@ Think of your recommendation profile like a credit score — one portable, verif
 - **You carry it forward**: Move to a new platform? Bring your preferences with you. No cold start. No algorithmic amnesia.
 - **It's auditable**: Open the file in a text editor. See exactly what's stored. No hidden data.
 
-Today the repository includes:
+The repository includes:
 
 - an ORF profile model for portable preference data
 - Ed25519 keys and signed sync events
 - a FastAPI service for hosted profile sync and public profile reads
 - an API-first demo flow for instant profile-based personalization and proof-of-control
-- a site-scoped consented access flow for manually registered pilot sites
+- a site-scoped consented access flow with required and optional scopes for manually registered pilot sites
 - a localhost-only browser consent review page for pending access requests
 - a localhost-only browser trust app with a consent inbox and Local Profile Lens
 - a local CLI for creating, editing, exporting, syncing, and resolving pilot access requests
+- a CLI `feed show` command for aggregating cross-site recommendations from the local event log
 - backup and restore CLI commands for portable profile + key recovery
 - a thin partner SDK module for site-side request, exchange, verify, and projection calls
-- pilot-safe service basics: auth-route rate limiting plus admin audit inspection endpoints
+- a browser SDK and sample React app for site-side integration in modern web apps
+- service basics: auth-route rate limiting and admin audit inspection endpoints
 - unit tests for merge rules, privacy boundaries, signatures, and hosted API flows
 
 ## What ORF means here
@@ -43,8 +45,10 @@ Public projections intentionally expose less than the full profile: only public 
 ## Quick start
 
 ```bash
-python -m pip install -e .[dev]
+python -m pip install -e '.[dev]'
 ```
+
+Quote `.[dev]` so the shell does not treat the brackets as a glob.
 
 Create a profile:
 
@@ -121,9 +125,42 @@ created = sdk.create_access_request(
     profile_id="<profile_id>",
     site_id="open-news-demo",
     purpose="Personalize the pilot site feed.",
-    requested_scopes=["profile.read", "topics.public"],
+    required_scopes=["profile.read", "topics.public"],
+    optional_scopes=["topics.selective:orf:media/podcasts"],
 )
 ```
+
+For browser and React apps, use the ESM browser SDK in `sdk/orf-web-sdk/`:
+
+```js
+import { ORFClient } from "@open-recommender/orf-web-sdk";
+const client = new ORFClient("http://127.0.0.1:8000");
+const result = await client.createAccessRequest({
+  profileId,
+  siteId: "open-news-demo",
+  purpose: "…",
+  requiredScopes: ["profile.read", "topics.public"],
+  optionalScopes: ["topics.selective:orf:media/podcasts"],
+});
+```
+
+Run the React demo (requires the ORF service to be running):
+
+```bash
+cd sdk/react-sample-app && npm install && npm run dev
+# → http://localhost:5173
+```
+
+The React demo can upload a local `.orf` file from the browser and register it with the local ORF
+service directly. If you also upload the matching `.orf.key`, the browser demo can finish the
+challenge-response step locally and fetch the projection without dropping to CLI. The private key
+stays in browser memory for that tab and only the signature is sent to the ORF service.
+
+The demo request also shows the newer scope contract: a small required baseline plus optional
+extras the user can remove without denying the whole request.
+
+If you prefer the CLI, `python -m open_recommender.cli sync-push profile.orf
+http://127.0.0.1:8000` still works too.
 
 Run the sample adopter site:
 
@@ -132,7 +169,7 @@ SAMPLE_SITE_DEMO_SIGNER_KEY_PATH=profile.orf.key \
 python -m uvicorn examples.sample_site:app --reload --port 9001
 ```
 
-Inspect or act on a Phase 2 site access request:
+Inspect or act on a site access request:
 
 ```bash
 python -m open_recommender.cli site-access-request-get <request_id> http://127.0.0.1:8000
@@ -167,11 +204,13 @@ Current FastAPI routes:
 - `GET /consent`
 - `GET /consent/grants`
 - `GET /consent/site-access-requests/{request_id}`
+- `GET /consent/site-access-requests/{request_id}/review-data`
 - `POST /consent/grants/{grant_id}/revoke`
 - `POST /consent/site-access-requests/{request_id}/approve`
 - `POST /consent/site-access-requests/{request_id}/deny`
 - `GET /lens`
 - `GET /lens/profiles`
+- `POST /lens/profiles/import`
 - `GET /lens/profiles/{profile_id}`
 - `GET /lens/profiles/{profile_id}/pending-requests`
 - `GET /demo/site/{profile_id}`
@@ -224,7 +263,7 @@ http://127.0.0.1:8000/lens
 http://127.0.0.1:8000/consent
 ```
 
-Current v0 behavior:
+Current behavior:
 
 - load a local `.orf` file directly in the browser
 - or load a profile already registered in the local service
@@ -236,9 +275,9 @@ Current v0 behavior:
 - inspect active, revoked, and expired grants
 - revoke an active grant to block future exchange attempts for that grant
 
-## Phase 2 CLI approval flow
+## Site access request approval flow
 
-For the Phase 2 pilot flow, a site first creates a scoped access request through the service API. The ORF user can then inspect and resolve that request from the CLI:
+For the site access request flow, a site first creates a scoped access request through the service API. The ORF user can then inspect and resolve that request from the CLI:
 
 ```bash
 python -m open_recommender.cli site-access-request-get <request_id> http://127.0.0.1:8000
@@ -259,7 +298,7 @@ The service also returns a localhost-only browser review link for the same reque
 
 That page is meant for local review while the service is bound to localhost. It shows the site, purpose, requested scopes, and a plain-language preview of what the site could see if approved.
 
-For pilot adopters, the repo also now includes `examples/pilot_flow.py`, a runnable reference integration that shows the site-side HTTP calls plus the user-side signature handoff in one file.
+For pilot adopters, the repo includes `examples/pilot_flow.py`, a runnable reference integration that shows the site-side HTTP calls plus the user-side signature handoff in one file.
 
 To validate the flow in a more realistic site-shaped artifact, the repo also includes `examples/sample_site.py`, a tiny adopter app that creates requests against the ORF service and, in localhost demo mode only, can finish the proof step with a clearly-labeled demo signer key path.
 
@@ -286,7 +325,7 @@ Once verification succeeds, the CLI can inspect the consented projection tied to
 python -m open_recommender.cli grant-session-projection <session_id> http://127.0.0.1:8000
 ```
 
-Expected v0 behavior:
+Expected behavior:
 
 - denied or expired requests cannot move into exchange
 - expired or replayed challenges are rejected
@@ -308,10 +347,22 @@ curl -H "X-Open-Recommender-Admin-Token: dev-admin-token" \
 
 These endpoints are meant for local and pilot investigation, not end-user access.
 
+## Cross-site feed
+
+If RECOMMEND events have been pushed to the local profile from multiple sites, the CLI can aggregate them into a ranked feed:
+
+```bash
+python -m open_recommender.cli feed show profile.orf
+python -m open_recommender.cli feed show profile.orf --top-n 10
+```
+
+The feed is computed locally from the profile's event log. It de-duplicates items recommended by multiple sites and ranks them by consensus (how many sites agree), freshness, and topic affinity. See [Cross-site feed](docs/cross-site-feed.md) for details.
+
 ## Repository layout
 
 ```text
 src/open_recommender/   Core package, CLI, models, API, and SQLite store
+sdk/                    Browser SDK and sample React app for adopter integration
 tests/                  unittest coverage for models and service flows
 docs/                   Deeper contributor and architecture documentation
 examples/               Reference flows and pilot examples
@@ -323,7 +374,7 @@ examples/               Reference flows and pilot examples
 - [Local proof-of-concept testing](docs/local-poc-testing.md)
 - [Pilot integration flow](docs/pilot-integration.md)
 - [Architecture](docs/architecture.md)
-- [Phase 2 cross-site feed](docs/phase-2-cross-site-feed.md)
-- [Phase 2 integration guide](docs/phase-2-integration-guide.md)
+- [Cross-site feed](docs/cross-site-feed.md)
+- [Integration guide](docs/integration-guide.md)
 - [Transparency and security](docs/transparency-and-security.md)
 - [Contributing](CONTRIBUTING.md)

@@ -55,9 +55,15 @@ class PartnerSDKTests(unittest.TestCase):
             profile_id=self.profile.profile_id,
             site_id="open-news-demo",
             purpose="Personalize the pilot site feed.",
-            requested_scopes=["profile.read", "topics.public", "topics.selective:orf:media/podcasts"],
+            required_scopes=["profile.read"],
+            optional_scopes=["topics.public", "topics.selective:orf:media/podcasts"],
         )
         request_id = created["access_request"]["request_id"]
+        self.assertEqual(created["access_request"]["required_scopes"], ["profile.read"])
+        self.assertEqual(
+            created["access_request"]["optional_scopes"],
+            ["topics.public", "topics.selective:orf:media/podcasts"],
+        )
 
         approval = self.client.post(f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approval.status_code, 200)
@@ -91,3 +97,12 @@ class PartnerSDKTests(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("not approved", str(context.exception.detail))
 
+    def test_partner_sdk_rejects_mixed_legacy_and_explicit_scope_fields(self) -> None:
+        with self.assertRaises(ValueError):
+            self.partner.create_access_request(
+                profile_id=self.profile.profile_id,
+                site_id="open-news-demo",
+                purpose="Personalize the pilot site feed.",
+                requested_scopes=["profile.read"],
+                required_scopes=["profile.read"],
+            )

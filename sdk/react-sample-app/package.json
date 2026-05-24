@@ -1,0 +1,24 @@
+{
+  "name": "orf-react-sample-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sample React app demonstrating the Open Recommender browser SDK.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "npm run test:browser",
+    "test:browser": "node tests/browser-smoke.mjs"
+  },
+  "dependencies": {
+    "@open-recommender/orf-web-sdk": "file:../orf-web-sdk",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "puppeteer": "^24.15.0",
+    "vite": "^5.4.19"
+  }
+}

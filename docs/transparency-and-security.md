@@ -136,7 +136,7 @@ Open Recommender uses two file types with different security properties:
 - **`.orf` (active profile):** plain-text JSON by design, so you can inspect and audit it in a text editor.
 - **`.orfb` (backup bundle):** encrypted with your backup passphrase.
 
-So the active `.orf` profile is **not encrypted JSON** today. Its protection model is:
+So the active `.orf` profile is **not encrypted JSON**. Its protection model is:
 
 - **Integrity/authenticity:** Ed25519 signatures detect tampering.
 - **Confidentiality at rest:** provided by encrypted backups (`.orfb`), not by the live `.orf` file.
@@ -148,7 +148,7 @@ So the active `.orf` profile is **not encrypted JSON** today. Its protection mod
 If you sync with a hosted service, you can request your own events:
 
 ```bash
-python -m open_recommender.cli sync-pull profile.orf http://open-recommender.example.com --show-raw
+python -m open_recommender.cli sync-pull profile.orf http://open-recommender.example.com
 ```
 
 Compare the service's events to your local `.orf` file. They should be identical (append-only, no deletions, no mutations).
@@ -169,15 +169,15 @@ If something looks off, open an issue or submit a PR.
 
 ### Can I revoke access?
 
-**Yes.** If a partner site has your projection, you can revoke their grant:
+**Yes.** If a partner site has your projection, you can revoke their grant from the localhost trust app:
 
-```bash
-python -m open_recommender.cli grant-revoke profile.orf <site_id>
+```text
+http://127.0.0.1:8000/consent/grants
 ```
 
 This:
-- Removes the site's access grant from your `.orf` file.
-- (If hosted sync is enabled) Sends a revocation event to the service.
+- Marks the grant as revoked in the service.
+- Revoked grants cannot mint new exchange sessions.
 - Does **not** delete data the site *already received*. The site must respect the revocation on their end.
 
 **Important:** Open Recommender can't force sites to delete data they already have. You need to trust their privacy policy, or choose sites that publish data-retention guarantees.
@@ -194,16 +194,14 @@ Because we don't store PII, deletion is simple — just remove the events log ti
 
 ## Rate Limiting & Abuse Prevention
 
-The service enforces rate limiting on:
-- **Challenge issuance** — max 10 requests per device per 5 minutes
-- **Event ingestion** — max 100 events per profile per 5 minutes
+The service enforces per-client rate limiting on auth-sensitive routes including challenge issuance, verify, exchange, approvals, and projection reads.
+
+The rate limit window and request ceiling are configurable via `OPEN_RECOMMENDER_RATE_LIMIT_WINDOW_SECONDS` and `OPEN_RECOMMENDER_RATE_LIMIT_MAX_REQUESTS`. The health endpoint reports the active values.
 
 This prevents:
 - Brute-force attacks on challenge-response flows
 - Flooding the database with junk events
 - Profile enumeration (scanning for valid profile IDs)
-
-These limits apply per device, not per IP, so legitimate multi-device users aren't unfairly restricted.
 
 ---
 
@@ -211,15 +209,13 @@ These limits apply per device, not per IP, so legitimate multi-device users aren
 
 **Hosted sync:**
 - Events are kept forever (append-only log).
-- Backups are encrypted at rest (the service operator has a key, but cannot decrypt individual events).
 
 **Local CLI:**
 - Your `.orf` file is kept as long as you don't delete it.
 - Backups are encrypted with your passphrase (nobody but you can decrypt them).
 
 **Service logs:**
-- Request/response logs are rotated daily (kept for 7 days by default).
-- Error logs are kept for 30 days.
+- The reference service does not add any log rotation or retention policy by default. Log handling is the responsibility of the operator deploying the service.
 - No profile data is included in logs unless a request fails signature verification (in which case we log the validation error, not the profile itself).
 
 ---

@@ -90,14 +90,24 @@ class PartnerClient:
         profile_id: str,
         site_id: str,
         purpose: str,
-        requested_scopes: list[str],
+        requested_scopes: list[str] | None = None,
+        required_scopes: list[str] | None = None,
+        optional_scopes: list[str] | None = None,
         expires_at: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "site_id": site_id,
-            "purpose": purpose,
-            "requested_scopes": requested_scopes,
-        }
+        payload: dict[str, Any] = {"site_id": site_id, "purpose": purpose}
+        has_explicit_scope_tiers = required_scopes is not None or optional_scopes is not None
+        if has_explicit_scope_tiers and requested_scopes is not None:
+            raise ValueError(
+                "Use either requested_scopes or required_scopes/optional_scopes, not both."
+            )
+        if has_explicit_scope_tiers:
+            if required_scopes is not None:
+                payload["required_scopes"] = required_scopes
+            if optional_scopes is not None:
+                payload["optional_scopes"] = optional_scopes
+        else:
+            payload["requested_scopes"] = requested_scopes or []
         if expires_at is not None:
             payload["expires_at"] = expires_at
         return self._request(

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
 from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from .models import ORFProfile, SignedEvent
@@ -261,31 +262,44 @@ def _render_projection_preview(projection: dict[str, Any] | None) -> str:
     return "".join(sections)
 
 
-def _scope_groups(scope_list: list[str]) -> tuple[list[str], list[str]]:
-    already_public = [
+def _scope_groups(
+    required_scope_list: list[str],
+    optional_scope_list: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    optional_already_public = [
         scope
-        for scope in scope_list
+        for scope in optional_scope_list
         if scope in {"profile.read", "topics.public", "consent.summary"}
     ]
-    newly_shared = [scope for scope in scope_list if scope.startswith("topics.selective:")]
-    return already_public, newly_shared
+    optional_newly_shared = [
+        scope for scope in optional_scope_list if scope.startswith("topics.selective:")
+    ]
+    return required_scope_list, optional_already_public, optional_newly_shared
 
 
-def _render_scope_group(title: str, hint: str, scopes: list[str], *, checked: bool = True) -> str:
+def _render_scope_group(
+    title: str,
+    hint: str,
+    scopes: list[str],
+    *,
+    checked: bool = True,
+    disabled: bool = False,
+) -> str:
     if not scopes:
         return ""
     checked_attr = " checked" if checked else ""
+    disabled_attr = " disabled" if disabled else ""
     items = []
     for scope in scopes:
         items.append(
             "<label class='scope-row'>"
-            f"<input type='checkbox' name='approved-scope' value='{escape(scope)}'{checked_attr}>"
+            f"<input type='checkbox' name='approved-scope' value='{escape(scope)}'{checked_attr}{disabled_attr}>"
             "<span>"
             f"<strong>{escape(_scope_label(scope))}</strong><br>"
             f"<span class='muted'>{escape(_scope_description(scope))}</span>"
             "</span>"
             "</label>"
-        )
+            )
     return (
         "<div class='scope-group'>"
         f"<h3>{escape(title)}</h3>"
@@ -295,23 +309,69 @@ def _render_scope_group(title: str, hint: str, scopes: list[str], *, checked: bo
     )
 
 
-def _render_scope_review(scope_list: list[str], *, checked: bool = True) -> str:
-    already_public, newly_shared = _scope_groups(scope_list)
+def _render_scope_review(
+    required_scope_list: list[str],
+    optional_scope_list: list[str],
+    *,
+    checked: bool = True,
+) -> str:
+    required_scopes, optional_already_public, optional_newly_shared = _scope_groups(
+        required_scope_list,
+        optional_scope_list,
+    )
     sections = [
         _render_scope_group(
-            "Already public or identity-level",
-            "These items confirm data the site can already read publicly or use to recognize your portable profile.",
-            already_public,
+            "Required to continue",
+            "These scopes are mandatory for this sign-in flow. If you do not want to share them, deny the request instead of trying to uncheck them.",
+            required_scopes,
+            checked=True,
+            disabled=True,
+        ),
+        _render_scope_group(
+            "Optional already-public or identity-level",
+            "These items are optional extras. They cover public or identity-level data you can still skip.",
+            optional_already_public,
             checked=checked,
         ),
         _render_scope_group(
-            "Newly shared with this site only",
+            "Optional newly shared with this site only",
             "These selective topics are not public. They only become visible to this site if you keep them checked.",
-            newly_shared,
+            optional_newly_shared,
             checked=checked,
         ),
     ]
     return "".join(section for section in sections if section)
+
+
+def _scope_group_payload(
+    required_scope_list: list[str],
+    optional_scope_list: list[str],
+    *,
+    checked: bool = True,
+) -> dict[str, list[dict[str, Any]]]:
+    required_scopes, optional_already_public, optional_newly_shared = _scope_groups(
+        required_scope_list,
+        optional_scope_list,
+    )
+
+    def _serialize(scopes: list[str], *, required: bool = False, disabled: bool = False) -> list[dict[str, Any]]:
+        return [
+            {
+                "scope": scope,
+                "label": _scope_label(scope),
+                "description": _scope_description(scope),
+                "checked": True if required else checked,
+                "required": required,
+                "disabled": disabled,
+            }
+            for scope in scopes
+        ]
+
+    return {
+        "required": _serialize(required_scopes, required=True, disabled=True),
+        "optional_already_public": _serialize(optional_already_public),
+        "optional_newly_shared": _serialize(optional_newly_shared),
+    }
 
 
 def _render_trust_nav(*, active: str) -> str:
@@ -544,14 +604,16 @@ def _render_consent_review_page(
         )
 
     requested_scopes = [str(scope) for scope in access_request.get("requested_scopes", [])]
+    required_scopes = [str(scope) for scope in access_request.get("required_scopes", [])]
+    optional_scopes = [str(scope) for scope in access_request.get("optional_scopes", [])]
     status = str(access_request.get("status", "unknown"))
     action_block = ""
     if status == "pending":
         action_block = f"""
         <div class="card">
           <h2>Decide what this site can see</h2>
-          <p class="muted">Identity and already-public items keep the standard portable-profile flow intact. Uncheck any selective topic you do not want to share only with this site.</p>
-          <div class="scope-list">{_render_scope_review(requested_scopes)}</div>
+          <p class="muted">Required scopes keep the site's requested sign-in contract intact. Optional scopes are the extra data you can remove before approving.</p>
+          <div class="scope-list">{_render_scope_review(required_scopes, optional_scopes)}</div>
           <label class="deny-reason">
             <span>Deny reason (optional)</span>
             <input id="deny-reason" type="text" placeholder="Why are you declining this request?">
@@ -616,11 +678,13 @@ def _render_consent_review_page(
         <p><strong>Site:</strong> {escape(str(access_request.get('site_name', 'Unknown site')))}</p>
         <p><strong>Purpose:</strong> {escape(str(access_request.get('purpose', 'No purpose provided.')))}</p>
         <p><strong>Status:</strong> {escape(status)}</p>
+        <p><strong>Required scopes:</strong> {escape(', '.join(required_scopes) or 'None')}</p>
+        <p><strong>Optional scopes:</strong> {escape(', '.join(optional_scopes) or 'None')}</p>
         <p><strong>Profile:</strong> {escape(profile_id)}</p>
       </div>
       <div class="card">
         <h2>How to read this page</h2>
-        <p class="muted">Public topics are already shareable. Selective topics are only shared if you approve them here. Private topics stay on this device.</p>
+        <p class="muted">Required scopes are all-or-nothing for this request. Optional scopes are the parts you can keep or remove. Private topics stay on this device either way.</p>
       </div>
     </div>
     {ignored_html}
@@ -703,6 +767,7 @@ def _render_profile_lens_page() -> str:
     .controls { display: grid; gap: 12px; }
     input[type='file'], select { width: 100%; margin-top: 6px; padding: 10px 12px; border-radius: 10px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; }
     button { border: 0; border-radius: 10px; padding: 10px 14px; background: #2563eb; color: white; cursor: pointer; font-size: 14px; }
+    button.secondary { background: #334155; }
     .button-link { display: inline-block; text-decoration: none; border-radius: 10px; padding: 10px 14px; background: #2563eb; color: white; }
     .scope-list { display: grid; gap: 10px; margin-top: 12px; }
     .scope-group { border-top: 1px solid #1e293b; padding-top: 12px; }
@@ -732,6 +797,10 @@ def _render_profile_lens_page() -> str:
           </label>
           <button id="load-stored-button" type="button">Load stored profile</button>
           <p class="muted" id="source-status">No profile loaded yet.</p>
+          <div id="local-file-actions" style="display:none;">
+            <p class="muted" id="register-status">This local file is only loaded in the browser until you register it with this local service.</p>
+            <button id="register-local-profile" type="button" class="secondary">Register or update in local service</button>
+          </div>
         </div>
       </section>
       <section class="card">
@@ -781,7 +850,7 @@ def _render_profile_lens_page() -> str:
     </div>
   </main>
   <script>
-    const state = { profile: null };
+    const state = { profile: null, localProfileDocument: null };
     const initialProfileId = new URLSearchParams(window.location.search).get("profile_id");
 
     function humanizeTopic(topic) {
@@ -889,6 +958,27 @@ def _render_profile_lens_page() -> str:
       `;
     }
 
+    function showLocalFileActions(message) {
+      document.getElementById("local-file-actions").style.display = "block";
+      document.getElementById("register-status").textContent = message;
+    }
+
+    function hideLocalFileActions() {
+      document.getElementById("local-file-actions").style.display = "none";
+      document.getElementById("register-status").textContent = "This local file is only loaded in the browser until you register it with this local service.";
+    }
+
+    function upsertStoredProfileOption(profile) {
+      const select = document.getElementById("stored-profile-select");
+      let option = Array.from(select.options).find((item) => item.value === profile.profile_id);
+      if (!option) {
+        option = document.createElement("option");
+        option.value = profile.profile_id;
+        select.appendChild(option);
+      }
+      option.textContent = `${profile.display_name} (${profile.profile_id})`;
+    }
+
     async function loadPendingRequests(profileId) {
       const container = document.getElementById("pending-requests");
       const response = await fetch(`/lens/profiles/${encodeURIComponent(profileId)}/pending-requests`);
@@ -910,10 +1000,15 @@ def _render_profile_lens_page() -> str:
       `).join("");
     }
 
-    function renderProfile(profile, sourceLabel) {
+    function renderProfile(profile, sourceLabel, options = {}) {
       state.profile = profile;
       document.getElementById("lens-root").style.display = "block";
       document.getElementById("source-status").textContent = sourceLabel;
+      if (options.localPreview) {
+        showLocalFileActions("This local file is only in your browser. Register it with the local service before using the React demo or reviewing service-side requests.");
+      } else {
+        hideLocalFileActions();
+      }
 
       const privateTopics = profile.topics.filter((topic) => topic.visibility === "private");
       const publicTopics = computePublicTopics(profile);
@@ -996,6 +1091,7 @@ def _render_profile_lens_page() -> str:
         return;
       }
       const body = await response.json();
+      state.localProfileDocument = null;
       renderProfile(body.profile, "Loaded the locally stored copy from this service.");
     }
 
@@ -1011,7 +1107,38 @@ def _render_profile_lens_page() -> str:
       }
       const text = await file.text();
       const profile = JSON.parse(text);
-      renderProfile(profile, `Loaded local file: ${file.name}`);
+      state.localProfileDocument = profile;
+      renderProfile(profile, `Loaded local file: ${file.name}`, { localPreview: true });
+    });
+
+    document.getElementById("register-local-profile").addEventListener("click", async () => {
+      if (!state.localProfileDocument) {
+        showLocalFileActions("Choose a local .orf file first.");
+        return;
+      }
+      const button = document.getElementById("register-local-profile");
+      button.disabled = true;
+      showLocalFileActions("Registering this profile with the local service…");
+      try {
+        const response = await fetch("/lens/profiles/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile: state.localProfileDocument })
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          showLocalFileActions(body.detail || "Could not register this profile with the local service.");
+          return;
+        }
+        state.localProfileDocument = null;
+        upsertStoredProfileOption(body.profile);
+        document.getElementById("stored-profile-select").value = body.profile.profile_id;
+        renderProfile(body.profile, "Registered this local profile with the local service.");
+      } catch (error) {
+        showLocalFileActions(`Could not register this profile: ${error}`);
+      } finally {
+        button.disabled = false;
+      }
     });
 
     loadStoredProfiles();
@@ -1051,6 +1178,13 @@ def create_app(
         title="Open Recommender API",
         version="0.1.0",
         description="Hosted sync and public profile API for portable ORF profiles.",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     store = SQLiteStore(config.db_path, pilot_sites=resolved_pilot_sites)
     rate_limiter = FixedWindowRateLimiter(
@@ -1196,11 +1330,30 @@ def create_app(
     def create_site_access_request(profile_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
         enforce_rate_limit(request, "access-request-create")
         try:
+            has_explicit_scope_tiers = "required_scopes" in body or "optional_scopes" in body
+            if has_explicit_scope_tiers and "requested_scopes" in body:
+                raise ValueError(
+                    "Use either legacy requested_scopes or required_scopes/optional_scopes, not both."
+                )
             access_request = store.create_access_request(
                 profile_id,
                 site_id=str(body["site_id"]),
                 purpose=str(body["purpose"]),
-                requested_scopes=[str(scope) for scope in body.get("requested_scopes", [])],
+                requested_scopes=(
+                    [str(scope) for scope in body.get("requested_scopes", [])]
+                    if not has_explicit_scope_tiers
+                    else None
+                ),
+                required_scopes=(
+                    [str(scope) for scope in body.get("required_scopes", [])]
+                    if has_explicit_scope_tiers
+                    else None
+                ),
+                optional_scopes=(
+                    [str(scope) for scope in body.get("optional_scopes", [])]
+                    if has_explicit_scope_tiers
+                    else None
+                ),
                 expires_at=str(body["expires_at"]) if body.get("expires_at") is not None else None,
             )
         except KeyError as error:
@@ -1306,6 +1459,34 @@ def create_app(
             )
         )
 
+    @app.get("/consent/site-access-requests/{request_id}/review-data")
+    def get_consent_review_data(request_id: str, request: Request) -> dict[str, Any]:
+        require_local_browser(request)
+        try:
+            profile_id, access_request = store.get_access_request(request_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        preview_projection = None
+        profile = store.get_profile(profile_id)
+        if profile is not None:
+            preview_projection = profile.consented_projection(
+                access_request.requested_scopes,
+                site_id=access_request.site_id,
+                grant_id="preview",
+                schema_version=access_request.schema_version,
+            )
+        return {
+            "profile_id": profile_id,
+            "access_request": access_request.to_dict(),
+            "projection_preview": preview_projection,
+            "csrf_token": issue_consent_csrf_token(request_id),
+            "scope_groups": _scope_group_payload(
+                list(access_request.required_scopes),
+                list(access_request.optional_scopes),
+            ),
+        }
+
     @app.post("/consent/site-access-requests/{request_id}/approve")
     def approve_site_access_request_browser(
         request_id: str,
@@ -1387,6 +1568,19 @@ def create_app(
             for profile in store.list_profiles()
         ]
         return {"profiles": profiles}
+
+    @app.post("/lens/profiles/import")
+    def import_profile_lens_profile(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        require_local_browser(request)
+        try:
+            profile = ORFProfile.from_document(body["profile"])
+            saved = store.save_profile(profile)
+        except (KeyError, TypeError, ValueError, InvalidSignature) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "message": "Profile registered in the local service.",
+            "profile": _lens_profile_payload(saved),
+        }
 
     @app.get("/lens/profiles/{profile_id}")
     def get_profile_lens_profile(profile_id: str, request: Request) -> dict[str, Any]:

@@ -1,0 +1,27 @@
+{
+  "name": "@open-recommender/orf-web-sdk",
+  "version": "0.1.0",
+  "description": "Browser-friendly ESM client for the Open Recommender hosted ORF service.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "open-recommender",
+    "orf",
+    "browser",
+    "esm"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

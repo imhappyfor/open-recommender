@@ -11,7 +11,7 @@ from .crypto import fingerprint_public_key
 
 
 CURRENT_PROFILE_SCHEMA_VERSION = "0.1.0"
-CURRENT_CONTRACT_SCHEMA_VERSION = "0.2.0"
+CURRENT_CONTRACT_SCHEMA_VERSION = "0.3.0"
 SELECTIVE_TOPIC_SCOPE_PREFIX = "topics.selective:"
 
 
@@ -173,6 +173,41 @@ def selective_topics_from_scopes(scopes: Iterable[str]) -> set[str]:
     return {topic for topic in topics if topic is not None}
 
 
+def normalize_request_scope_sets(
+    *,
+    requested_scopes: Iterable[str] | None = None,
+    required_scopes: Iterable[str] | None = None,
+    optional_scopes: Iterable[str] | None = None,
+    ignore_unknown_required: bool = False,
+    ignore_unknown_optional: bool = True,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    normalized_required, unknown_required = normalize_scope_set(
+        required_scopes or [],
+        ignore_unknown=ignore_unknown_required,
+    )
+    if optional_scopes is None:
+        normalized_optional, unknown_optional = normalize_scope_set(
+            requested_scopes or [],
+            ignore_unknown=ignore_unknown_optional,
+        )
+    else:
+        normalized_optional, unknown_optional = normalize_scope_set(
+            optional_scopes,
+            ignore_unknown=ignore_unknown_optional,
+        )
+    optional_without_required = tuple(
+        scope for scope in normalized_optional if scope not in set(normalized_required)
+    )
+    requested = tuple(sorted({*normalized_required, *optional_without_required}))
+    return (
+        normalized_required,
+        optional_without_required,
+        requested,
+        unknown_required,
+        unknown_optional,
+    )
+
+
 @dataclass(slots=True)
 class SiteAccessRequest:
     schema_version: str
@@ -181,6 +216,8 @@ class SiteAccessRequest:
     site_name: str
     purpose: str
     requested_scopes: tuple[str, ...]
+    required_scopes: tuple[str, ...]
+    optional_scopes: tuple[str, ...]
     created_at: str
     expires_at: str | None = None
     status: AccessRequestStatus = AccessRequestStatus.PENDING
@@ -193,10 +230,16 @@ class SiteAccessRequest:
         site_id: str,
         site_name: str,
         purpose: str,
-        requested_scopes: Iterable[str],
+        requested_scopes: Iterable[str] | None = None,
+        required_scopes: Iterable[str] | None = None,
+        optional_scopes: Iterable[str] | None = None,
         expires_at: str | None = None,
     ) -> "SiteAccessRequest":
-        normalized_scopes, _ = normalize_scope_set(requested_scopes)
+        normalized_required, normalized_optional, normalized_scopes, _, _ = normalize_request_scope_sets(
+            requested_scopes=requested_scopes,
+            required_scopes=required_scopes,
+            optional_scopes=optional_scopes,
+        )
         return cls(
             schema_version=CURRENT_CONTRACT_SCHEMA_VERSION,
             request_id=str(uuid4()),
@@ -204,6 +247,8 @@ class SiteAccessRequest:
             site_name=site_name,
             purpose=purpose,
             requested_scopes=normalized_scopes,
+            required_scopes=normalized_required,
+            optional_scopes=normalized_optional,
             created_at=utc_now(),
             expires_at=expires_at,
         )
@@ -216,6 +261,8 @@ class SiteAccessRequest:
             "site_name": self.site_name,
             "purpose": self.purpose,
             "requested_scopes": list(self.requested_scopes),
+            "required_scopes": list(self.required_scopes),
+            "optional_scopes": list(self.optional_scopes),
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "status": self.status.value,
@@ -233,13 +280,19 @@ class SiteAccessRequest:
                 "site_name",
                 "purpose",
                 "requested_scopes",
+                "required_scopes",
+                "optional_scopes",
                 "created_at",
                 "expires_at",
                 "status",
             },
         )
         ensure_supported_schema_version(str(known["schema_version"]))
-        normalized_scopes, _ = normalize_scope_set(known.get("requested_scopes", []))
+        normalized_required, normalized_optional, normalized_scopes, _, _ = normalize_request_scope_sets(
+            requested_scopes=known.get("requested_scopes", []),
+            required_scopes=known.get("required_scopes", []),
+            optional_scopes=known.get("optional_scopes"),
+        )
         return cls(
             schema_version=str(known["schema_version"]),
             request_id=str(known["request_id"]),
@@ -247,6 +300,8 @@ class SiteAccessRequest:
             site_name=str(known["site_name"]),
             purpose=str(known["purpose"]),
             requested_scopes=normalized_scopes,
+            required_scopes=normalized_required,
+            optional_scopes=normalized_optional,
             created_at=str(known["created_at"]),
             expires_at=str(known["expires_at"]) if known.get("expires_at") is not None else None,
             status=AccessRequestStatus(str(known.get("status", AccessRequestStatus.PENDING.value))),

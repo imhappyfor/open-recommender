@@ -19,6 +19,7 @@ from .models import (
     SignedEvent,
     SiteAccessRequest,
     SyncState,
+    normalize_request_scope_sets,
     normalize_scope_set,
     utc_now,
 )
@@ -424,13 +425,50 @@ class SQLiteStore:
             ),
         )
 
+    def _active_grant_for_request(
+        self,
+        *,
+        profile_id: str,
+        site_id: str,
+        purpose: str,
+        requested_scopes: tuple[str, ...],
+    ) -> AccessGrant | None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT g.grant_json, a.request_json
+                FROM grants g
+                JOIN access_requests a ON a.request_id = g.request_id
+                WHERE g.profile_id = ? AND g.site_id = ?
+                ORDER BY g.issued_at DESC, g.grant_id DESC
+                """,
+                (profile_id, site_id),
+            ).fetchall()
+
+        requested_scope_set = set(requested_scopes)
+        for row in rows:
+            grant = AccessGrant.from_dict(json.loads(row["grant_json"]))
+            if grant.extra_fields.get("revoked_at") is not None or self._is_expired(grant.expires_at):
+                continue
+            access_request = SiteAccessRequest.from_dict(json.loads(row["request_json"]))
+            if access_request.status != AccessRequestStatus.APPROVED:
+                continue
+            if access_request.purpose != purpose:
+                continue
+            if not requested_scope_set.issubset(set(grant.approved_scopes)):
+                continue
+            return grant
+        return None
+
     def create_access_request(
         self,
         profile_id: str,
         *,
         site_id: str,
         purpose: str,
-        requested_scopes: list[str] | tuple[str, ...],
+        requested_scopes: list[str] | tuple[str, ...] | None = None,
+        required_scopes: list[str] | tuple[str, ...] | None = None,
+        optional_scopes: list[str] | tuple[str, ...] | None = None,
         expires_at: str | None = None,
     ) -> SiteAccessRequest:
         if self.get_profile(profile_id) is None:
@@ -439,16 +477,36 @@ class SQLiteStore:
         if site["status"] != "active":
             raise ValueError("Pilot site is not active.")
 
-        normalized_scopes, ignored_scopes = normalize_scope_set(requested_scopes)
+        (
+            normalized_required_scopes,
+            normalized_optional_scopes,
+            normalized_scopes,
+            unknown_required_scopes,
+            ignored_scopes,
+        ) = normalize_request_scope_sets(
+            requested_scopes=requested_scopes,
+            required_scopes=required_scopes,
+            optional_scopes=optional_scopes,
+            ignore_unknown_required=True,
+            ignore_unknown_optional=True,
+        )
+        if unknown_required_scopes:
+            raise ValueError(
+                "Required scopes must all be known. Unknown required scopes: "
+                + ", ".join(unknown_required_scopes)
+            )
         if not normalized_scopes:
             raise ValueError("At least one known scope is required.")
-        self._validate_site_scopes(site, normalized_scopes)
+        self._validate_site_scopes(site, normalized_required_scopes)
+        self._validate_site_scopes(site, normalized_optional_scopes)
 
         request = SiteAccessRequest.create(
             site_id=site["site_id"],
             site_name=site["site_name"],
             purpose=purpose,
             requested_scopes=normalized_scopes,
+            required_scopes=normalized_required_scopes,
+            optional_scopes=normalized_optional_scopes,
             expires_at=expires_at,
         )
         if ignored_scopes:
@@ -479,9 +537,65 @@ class SQLiteStore:
                 profile_id=profile_id,
                 site_id=site["site_id"],
                 request_id=request.request_id,
-                payload={"requested_scopes": list(request.requested_scopes), "purpose": purpose},
+                payload={
+                    "requested_scopes": list(request.requested_scopes),
+                    "required_scopes": list(request.required_scopes),
+                    "optional_scopes": list(request.optional_scopes),
+                    "purpose": purpose,
+                },
             )
-        return request
+
+        reusable_grant = self._active_grant_for_request(
+            profile_id=profile_id,
+            site_id=site["site_id"],
+            purpose=purpose,
+            requested_scopes=normalized_scopes,
+        )
+        if reusable_grant is None:
+            return request
+
+        approved_request, approved_grant = self.approve_access_request(
+            request.request_id,
+            approved_scopes=list(normalized_scopes),
+            grant_expires_at=reusable_grant.expires_at,
+            actor="stored-grant-reuse",
+        )
+        approved_request.extra_fields["reused_prior_grant_id"] = reusable_grant.grant_id
+        approved_grant.extra_fields["reused_prior_grant_id"] = reusable_grant.grant_id
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE access_requests
+                SET request_json = ?, updated_at = ?
+                WHERE request_id = ?
+                """,
+                (
+                    json.dumps(approved_request.to_dict(), sort_keys=True),
+                    utc_now(),
+                    approved_request.request_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE grants
+                SET grant_json = ?
+                WHERE grant_id = ?
+                """,
+                (
+                    json.dumps(approved_grant.to_dict(), sort_keys=True),
+                    approved_grant.grant_id,
+                ),
+            )
+            self._write_audit_event(
+                connection,
+                "access-request.reused-grant",
+                profile_id=profile_id,
+                site_id=site["site_id"],
+                request_id=approved_request.request_id,
+                grant_id=approved_grant.grant_id,
+                payload={"reused_prior_grant_id": reusable_grant.grant_id},
+            )
+        return approved_request
 
     def get_access_request(self, request_id: str) -> tuple[str, SiteAccessRequest]:
         with self._connect() as connection:
@@ -686,6 +800,8 @@ class SQLiteStore:
             raise ValueError("At least one approved scope is required.")
         if not set(normalized_scopes).issubset(requested_scope_set):
             raise ValueError("Approved scopes must be a subset of the request scopes.")
+        if not set(request.required_scopes).issubset(set(normalized_scopes)):
+            raise ValueError("Required scopes cannot be removed from an approval. Deny the request instead.")
         self._validate_site_scopes(site, normalized_scopes)
 
         grant = AccessGrant.create(

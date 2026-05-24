@@ -225,9 +225,43 @@ class ModelTests(unittest.TestCase):
             request.requested_scopes,
             (AccessScope.PROFILE_READ.value, selective_topic_scope("orf:media/podcasts")),
         )
+        self.assertEqual(request.required_scopes, ())
+        self.assertEqual(
+            request.optional_scopes,
+            (AccessScope.PROFILE_READ.value, selective_topic_scope("orf:media/podcasts")),
+        )
         self.assertEqual(request.extra_fields["review_note"], "manual pilot allowlist")
         self.assertEqual(grant.extra_fields["exchange_method"], "challenge")
         self.assertEqual(session.extra_fields["transport"], "bearer")
+
+    def test_site_access_request_preserves_required_and_optional_scopes(self) -> None:
+        request = SiteAccessRequest.create(
+            site_id="site-1",
+            site_name="Pilot Site",
+            purpose="Personalize a home feed",
+            required_scopes=[AccessScope.PROFILE_READ.value],
+            optional_scopes=[
+                AccessScope.TOPICS_PUBLIC.value,
+                selective_topic_scope("orf:media/podcasts"),
+            ],
+        )
+
+        self.assertEqual(request.required_scopes, (AccessScope.PROFILE_READ.value,))
+        self.assertEqual(
+            request.optional_scopes,
+            (
+                AccessScope.TOPICS_PUBLIC.value,
+                selective_topic_scope("orf:media/podcasts"),
+            ),
+        )
+        self.assertEqual(
+            request.requested_scopes,
+            (
+                AccessScope.PROFILE_READ.value,
+                AccessScope.TOPICS_PUBLIC.value,
+                selective_topic_scope("orf:media/podcasts"),
+            ),
+        )
 
 
 class AggregatedFeedTests(unittest.TestCase):

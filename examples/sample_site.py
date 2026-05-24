@@ -83,7 +83,8 @@ def _render_page(
           <p><strong>Request ID:</strong> {access_request['request_id']}</p>
           <p><strong>Status:</strong> {status}</p>
           <p><strong>Purpose:</strong> {access_request['purpose']}</p>
-          <p><strong>Scopes:</strong> {", ".join(access_request['requested_scopes'])}</p>
+          <p><strong>Required scopes:</strong> {", ".join(access_request.get('required_scopes', [])) or "None"}</p>
+          <p><strong>Optional scopes:</strong> {", ".join(access_request.get('optional_scopes', [])) or "None"}</p>
           {action_html}
         </section>
         """
@@ -152,6 +153,7 @@ def _render_page(
           <li><strong>The user's ORF client</strong> approves the request and signs the challenge.</li>
           <li><strong>The demo signer</strong> exists only for localhost validation and must not be copied into a real deployment.</li>
         </ul>
+        <p class="muted">This sample asks for a small required baseline and one optional selective topic, so it demonstrates both “must have” and “nice to have” scopes.</p>
       </section>
     </div>
     {request_card}
@@ -194,9 +196,11 @@ def create_sample_site_app(
             {
                 "site_id": "open-news-demo",
                 "purpose": "Personalize the pilot site feed.",
-                "requested_scopes": [
+                "required_scopes": [
                     "profile.read",
                     "topics.public",
+                ],
+                "optional_scopes": [
                     "topics.selective:orf:media/podcasts",
                 ],
             },

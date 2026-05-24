@@ -1,0 +1,101 @@
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 0;
+  background: #020617;
+  color: #e2e8f0;
+  font-size: 15px;
+}
+
+h1 { font-size: 1.5rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 0 0 12px; }
+
+a { color: #60a5fa; }
+
+.lead { color: #94a3b8; margin: 0 0 20px; font-size: 0.95rem; }
+
+main {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 28px 20px 64px;
+}
+
+.grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin-bottom: 14px;
+}
+
+.card {
+  background: #111827;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin-left: 8px;
+}
+.badge-pending   { background: #1e3a5f; color: #93c5fd; }
+.badge-approved  { background: #14532d; color: #86efac; }
+.badge-denied    { background: #450a0a; color: #fca5a5; }
+.badge-exchange  { background: #3b1f6e; color: #c4b5fd; }
+.badge-done      { background: #065f46; color: #6ee7b7; }
+
+.banner {
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+.banner-error { background: #450a0a; border: 1px solid #dc2626; }
+.banner-info  { background: #1e293b; border: 1px solid #475569; }
+
+input[type="text"] {
+  width: 100%;
+  margin-top: 6px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 14px;
+}
+
+label { display: block; font-weight: 600; font-size: 0.9rem; }
+
+button {
+  margin-top: 14px;
+  padding: 9px 16px;
+  border: none;
+  border-radius: 8px;
+  background: #2563eb;
+  color: white;
+  font-size: 14px;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary { background: #334155; }
+
+ul { margin: 8px 0; padding-left: 20px; }
+li { margin-bottom: 4px; }
+
+.muted { color: #94a3b8; font-size: 0.875rem; }
+
+.scope-tag {
+  display: inline-block;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  margin: 2px;
+  font-family: monospace;
+}

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `AggregatedFeed` class is the core Phase 2 component that reads events from a user's `.orf` file (synced across multiple sites), de-duplicates recommendations, and ranks them by a composite score: **consensus** (how many sites recommend this?) + **freshness** (recent > old) + **user affinity** (matches user's topic interests).
+The `AggregatedFeed` class reads events from a user's `.orf` file (synced across multiple sites), de-duplicates recommendations, and ranks them by a composite score: **consensus** (how many sites recommend this?) + **freshness** (recent > old) + **user affinity** (matches user's topic interests).
 
 **Key design principle:** Feed aggregation is stateless. It reads from event logs only; no side effects, no external service calls needed.
 
@@ -160,7 +160,7 @@ where:
   half_life_days = 30 (default, configurable)
 
 Examples (with 30-day half-life):
-  - 0 days old (today): 0.5^(0/30) = 1.0
+  - 0 days old: 0.5^(0/30) = 1.0
   - 15 days old: 0.5^(15/30) = 0.707
   - 30 days old: 0.5^(30/30) = 0.5
   - 60 days old: 0.5^(60/30) = 0.25
@@ -270,7 +270,7 @@ Examples:
 
 5. **Filter out near-duplicates (optional anti-spam):**
     - Items with the same title but different external_id (e.g., same movie on Netflix & IMDb with different IDs)
-    - For MVP: **don't do fuzzy matching**—rely on sites having correct IDs
+    - Use exact site-provided IDs in the current reference implementation; do not add fuzzy matching
 
 ### Why This Approach?
 

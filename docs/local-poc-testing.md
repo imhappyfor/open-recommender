@@ -16,7 +16,7 @@ Everything below is grounded in the current repository behavior. IDs, timestamps
 From the repository root:
 
 ```bash
-python -m pip install -e .[dev]
+python -m pip install -e '.[dev]'
 mkdir -p .poc-work
 ```
 
@@ -525,7 +525,7 @@ Representative audit output excerpt:
 }
 ```
 
-## What this proof of concept demonstrates today
+## What this proof of concept demonstrates
 
 If all of the commands above succeed, the repo currently proves that Open Recommender can:
 

@@ -1,26 +1,18 @@
 # Architecture
 
-Open Recommender is a portable identity and state mechanism. The `.orf` file is not just a data container—it is the **lock-and-key** that eliminates account creation friction and enables continuous, portable personalization across sites.
+Open Recommender is a portable identity and preference state mechanism. The `.orf` file carries a user's identity and topic preferences so they can bring them to any site that supports the format.
 
 This document describes the architecture of the Python reference implementation.
 
-## Core Promise: Portable Identity & State
+## Core design: portable identity and state
 
-The `.orf` file serves three essential functions:
+The `.orf` file serves three functions:
 
-1. **Identity lock-and-key**: Your Ed25519 key pair embedded in the `.orf` file is your unforgeable identity. Sites authenticate you by verifying you can sign a challenge with your private key. No username. No password. No account creation.
+1. **Identity**: The Ed25519 key pair embedded in the `.orf` file is the user's identity. Sites authenticate users by verifying they can sign a challenge with their private key.
 
-2. **State container**: Your `.orf` file is the canonical source of your preference state. Sites sync with this state; they don't create their own copy. When you visit a new site, it pulls the delta (changes since last sync) and renders personalization immediately.
+2. **State container**: The `.orf` file holds the user's preference state as a signed event log. The events endpoint lets sites pull recent changes since a given clock value.
 
-3. **Portability substrate**: Because your identity and state live in a portable file, you carry them everywhere. Delete your account on one site, sign in on another with the same `.orf` file, and your preferences are immediately there.
-
-**The delta-sync contract:** Sites that support ORF must follow this pattern:
-- On page load, check if the user has an `.orf` file (device presence).
-- If yes, pull the delta from the user's profile (newer events since last sync timestamp).
-- Apply those events locally to re-render personalization.
-- Save the new sync timestamp to the `.orf` file (via the trust app or CLI).
-
-This contract makes "create an account" obsolete. The `.orf` file is the account.
+3. **Portability**: Because identity and state live in a portable file, users can bring their preferences to any site that uses the events-based delta-sync contract.
 
 ---
 
@@ -73,7 +65,7 @@ Only `public` topics appear in the public projection, and even then only when:
 - `consent.share_public_topics` is `true`
 - the topic is not listed in `opt_out_topics`
 
-The Phase 2 contract foundation also adds a **consented projection** helper for pilot-site access:
+The consent model also defines a **consented projection** for pilot-site access:
 
 - `public` topics are included only when the approved scope set contains `topics.public`
 - `selective` topics are included only when the approved scope set contains a matching
@@ -106,7 +98,7 @@ Supported operations:
 - `set_opt_out`
 - `set_profile`
 
-Important merge behavior implemented today:
+Important merge behavior implemented in the current reference implementation:
 
 - topic updates apply when the incoming clock is greater than or equal to the current topic clock
 - topic removals apply only when the incoming clock is strictly greater than the current topic clock
@@ -116,21 +108,21 @@ Important merge behavior implemented today:
 
 These rules are covered by `tests/test_models.py`.
 
-## Phase 2 consent contract foundation
+## Consent contract models
 
-`models.py` now includes shape helpers for the first pilot-site access contracts:
+`models.py` includes shape helpers for pilot-site access contracts:
 
 - `SiteAccessRequest`
 - `AccessGrant`
 - `GrantSession`
 
-These are intentionally narrow, reference-model contracts for manually registered pilot sites.
-They define the stable fields used by the current hosted request, approval, exchange, and
+These are narrow, reference-model contracts for manually registered pilot sites.
+They define the stable fields used by the hosted request, approval, exchange, and
 short-lived session flow.
 
 ### Scope model
 
-The supported v0 scope set is intentionally small:
+The supported scope set is intentionally small:
 
 - `profile.read`
 - `topics.public`
@@ -142,7 +134,7 @@ experiments do not break consumers.
 
 ### Compatibility behavior
 
-The repo now exposes compatibility helpers that define the current contract behavior:
+The repo includes compatibility helpers that define the contract behavior:
 
 - semantic versions use `major.minor.patch`
 - matching major versions are treated as supported
@@ -150,7 +142,7 @@ The repo now exposes compatibility helpers that define the current contract beha
   `extra_fields`
 - unknown scopes are ignored by default during normalization and consented-projection generation
 
-This keeps the v0 contract narrow while still allowing additive fields in later minor revisions.
+This keeps the contract narrow while still allowing additive fields in later minor revisions.
 
 ## Signing model
 
@@ -242,21 +234,25 @@ The current demo personalization is deterministic and simple:
 
 ---
 
-## Phase 2 Contract: Delta Sync & Continuous Personalization
+## Delta-sync events endpoint
 
-Open Recommender's value proposition depends on the delta-sync contract:
+The hosted service exposes an events endpoint that sites can use to pull a user's preference changes since a given clock value:
 
-**For every page load on a site that supports ORF:**
+```
+GET /profiles/{profile_id}/events?after_clock={last_sync_clock}
+```
 
-1. **Site detects ORF presence** — check if the browser has the ORF file (via storage, device presence, or user QR scan).
-2. **Pull delta on page load** — call `GET /profiles/{profile_id}/events?after_clock={last_sync_clock}` to retrieve only events newer than the user's last sync.
-3. **Apply events locally** — replay events into an in-memory profile state. This gives the site the current preference snapshot.
-4. **Render personalization** — rank feed / recommendations using the current state.
-5. **Save sync timestamp** — update `last_sync_clock` in the user's `.orf` file (via trust app, CLI, or device-stored state).
+This returns only events newer than the provided clock. A site can store the returned `last_clock` value and use it on the next pull to retrieve only new changes.
 
-**Result:** New users signing in with their `.orf` file see personalization *immediately* (no cold start). Existing users pulling delta changes see updated personalization without lag. The `.orf` file is always in sync because the site respects the sync timestamp contract.
+Event types returned:
 
-This delta-sync loop is the key to proving that portability is not overhead—it is the competitive advantage.
+- `set_topic` — user updated a topic weight or visibility
+- `remove_topic` — user removed a topic
+- `set_consent` — user changed a consent flag
+- `set_opt_out` — user opted a topic in or out of sharing
+- `recommend` — a recommendation pushed from a site to the profile event log
+
+Sites calling this endpoint need the user's `profile_id` and (if sync token gating is enabled) a sync token.
 
 ## Storage model
 
@@ -280,7 +276,7 @@ Behavior to know:
 
 ## CLI workflow
 
-The CLI currently supports:
+The CLI supports:
 
 - `create`
 - `topic-set`
@@ -290,6 +286,13 @@ The CLI currently supports:
 - `export-public`
 - `sync-push`
 - `sync-pull`
+- `site-access-request-get`
+- `site-access-request-approve`
+- `site-access-request-deny`
+- `grant-session-projection`
+- `backup-create`
+- `backup-restore`
+- `feed show`
 
 The CLI is intentionally thin:
 
