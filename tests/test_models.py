@@ -21,6 +21,13 @@ from open_recommender.models import (
     selective_topic_scope,
     utc_now,
 )
+from open_recommender.recommender import (
+    AggregatedFeed as RecommenderAggregatedFeed,
+    GrantFeedbackSignals,
+    GrantSessionRankRequest,
+    GrantSessionRanker,
+    RankingFeedbackEvent,
+)
 
 
 class ModelTests(unittest.TestCase):
@@ -264,6 +271,69 @@ class ModelTests(unittest.TestCase):
         )
 
 
+class GrantSessionRankingTests(unittest.TestCase):
+    def test_feedback_signals_flip_close_candidates(self) -> None:
+        ranking_request = GrantSessionRankRequest.from_dict(
+            {
+                "schema_version": "0.3.0",
+                "top_n": 2,
+                "include_debug": True,
+                "candidates": [
+                    {
+                        "candidate_id": "podcast-feature",
+                        "site_score": 0.55,
+                        "candidate_topics": ["orf:media/podcasts"],
+                    },
+                    {
+                        "candidate_id": "tech-feature",
+                        "site_score": 0.81,
+                        "candidate_topics": ["orf:technology/python"],
+                    },
+                ],
+            },
+            default_schema_version="0.3.0",
+        )
+        feedback_signals = GrantFeedbackSignals.from_events(
+            (
+                RankingFeedbackEvent.from_dict(
+                    {
+                        "event_id": "feedback-1",
+                        "event_type": "dismiss",
+                        "candidate_id": "podcast-feature",
+                        "candidate_topics": ["orf:media/podcasts"],
+                        "occurred_at": "2025-01-21T10:00:00+00:00",
+                    }
+                ),
+                RankingFeedbackEvent.from_dict(
+                    {
+                        "event_id": "feedback-2",
+                        "event_type": "save",
+                        "candidate_id": "tech-feature",
+                        "candidate_topics": ["orf:technology/python"],
+                        "occurred_at": "2025-01-21T10:01:00+00:00",
+                    }
+                ),
+            )
+        )
+
+        ranking = GrantSessionRanker(
+            {"orf:media/podcasts": 0.7},
+            feedback_signals=feedback_signals,
+        ).rank(
+            ranking_request,
+            site_id="open-news-demo",
+            grant_id="grant-123",
+        )
+
+        self.assertEqual(
+            [item.candidate_id for item in ranking.ranked_candidates],
+            ["tech-feature", "podcast-feature"],
+        )
+        self.assertIn("feedback-positive", ranking.ranked_candidates[0].reason_codes)
+        self.assertIn("feedback-negative", ranking.ranked_candidates[1].reason_codes)
+        self.assertIn("feedback_affinity", ranking.ranked_candidates[0].breakdown)
+
+
 class AggregatedFeedTests(unittest.TestCase):
     """Tests for Phase 2 cross-site recommendation aggregation."""
 
@@ -283,6 +353,12 @@ class AggregatedFeedTests(unittest.TestCase):
         feed = AggregatedFeed(self.profile)
         self.assertEqual(feed.top_n(), [])
         self.assertEqual(feed.aggregate(), [])
+
+    def test_models_import_reexports_recommender_feed(self) -> None:
+        """Legacy models import stays aligned with the recommender package."""
+        from open_recommender.models import AggregatedFeed
+
+        self.assertIs(AggregatedFeed, RecommenderAggregatedFeed)
 
     def test_single_source_recommendation(self) -> None:
         """Single source recommending an item creates aggregated recommendation."""

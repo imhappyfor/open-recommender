@@ -56,6 +56,31 @@ Create a profile:
 python -m open_recommender.cli create profile.orf --display-name "Alice Example" --device-id laptop
 ```
 
+Create a profile with a large randomized sample dataset:
+
+```bash
+python -m open_recommender.cli create seeded-profile.orf \
+  --display-name "Demo User" \
+  --device-id laptop \
+  --seed
+```
+
+The default seed now simulates 30 days of usage with repeated topic updates and 180 recommendation
+events, so the profile feels closer to an already-active user instead of a cold snapshot.
+
+Seed an existing profile with randomized topics, consent values, opt-outs, and recommendation
+events:
+
+```bash
+python -m open_recommender.cli seed profile.orf \
+  --seed-value 1234 \
+  --days 45 \
+  --recommendation-count 260
+```
+
+Both commands print the resolved seed value, simulated time window, and event summary so the same
+sample profile can be recreated later.
+
 Add a topic and inspect the public projection:
 
 ```bash
@@ -153,8 +178,9 @@ cd sdk/react-sample-app && npm install && npm run dev
 
 The React demo can upload a local `.orf` file from the browser and register it with the local ORF
 service directly. If you also upload the matching `.orf.key`, the browser demo can finish the
-challenge-response step locally and fetch the projection without dropping to CLI. The private key
-stays in browser memory for that tab and only the signature is sent to the ORF service.
+challenge-response step locally, fetch the projection, and rerank a sample site feed without
+dropping to CLI. The private key stays in browser memory for that tab and only the signature is
+sent to the ORF service.
 
 The demo request also shows the newer scope contract: a small required baseline plus optional
 extras the user can remove without denying the whole request.
@@ -201,6 +227,8 @@ Current FastAPI routes:
 - `POST /site-access-requests/{request_id}/exchange`
 - `POST /site-access-requests/{request_id}/verify`
 - `GET /grant-sessions/{session_id}/projection`
+- `POST /grant-sessions/{session_id}/rank`
+- `POST /grant-sessions/{session_id}/rank/feedback`
 - `GET /consent`
 - `GET /consent/grants`
 - `GET /consent/site-access-requests/{request_id}`
@@ -324,6 +352,55 @@ Once verification succeeds, the CLI can inspect the consented projection tied to
 ```bash
 python -m open_recommender.cli grant-session-projection <session_id> http://127.0.0.1:8000
 ```
+
+Or the site can rerank its own candidate set inside that verified grant-session boundary:
+
+```bash
+curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "0.3.0",
+    "top_n": 2,
+    "include_debug": false,
+    "candidates": [
+      {
+        "candidate_id": "story-123",
+        "site_score": 0.78,
+        "candidate_topics": ["orf:media/podcasts"]
+      }
+    ]
+  }'
+```
+
+This ranking call is reranking-only: the site still owns candidate generation, and the response stays
+privacy-bounded to scores, reason codes, and optional coarse debug breakdowns rather than raw profile
+topics or topic weights.
+
+If the site wants the hosted service to remember explicit outcomes for future reranks on the same
+grant, it can also send a narrow site-local feedback record:
+
+```bash
+curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "0.3.0",
+    "events": [
+      {
+        "event_id": "feedback-1",
+        "event_type": "click",
+        "candidate_id": "story-123",
+        "candidate_topics": ["orf:media/podcasts"],
+        "occurred_at": "2025-01-21T10:00:00+00:00"
+      }
+    ]
+  }'
+```
+
+Current feedback types are intentionally narrow: `click`, `dismiss`, and `save`. These events stay
+service-local, scoped to the site grant, and are used only to improve later `/rank` calls for that
+same grant. `event_id` is the caller-generated dedupe key, so safe retries do not create duplicate
+feedback rows. These events do **not** mutate the portable `.orf` profile and are **not** exposed
+through projection responses.
 
 Expected behavior:
 

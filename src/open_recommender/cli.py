@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import random
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error, request
 
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .crypto import (
     generate_key_pair,
@@ -19,6 +21,18 @@ from .crypto import (
     sign_payload,
 )
 from .models import EventOp, ORFProfile, build_signed_event
+from .seed_catalog import SEED_SITES, SEED_TOPICS
+
+
+DEFAULT_SEED_TOPIC_COUNT = 24
+DEFAULT_SEED_RECOMMENDATION_COUNT = 180
+DEFAULT_SEED_ACTIVITY_DAYS = 30
+
+if len(SEED_TOPICS) < DEFAULT_SEED_TOPIC_COUNT:
+    raise ValueError(
+        "Seed topic catalog must contain at least "
+        f"{DEFAULT_SEED_TOPIC_COUNT} topics, found {len(SEED_TOPICS)}."
+    )
 
 
 def load_profile(path: str | Path) -> ORFProfile:
@@ -50,40 +64,315 @@ def print_json(payload: dict) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def create_event(profile: ORFProfile, private_key_path: Path, op: EventOp, payload: dict) -> None:
-    private_key = load_private_key(private_key_path)
-    unsigned = {
-        "event_id": "",
-        "profile_id": profile.profile_id,
-        "device_id": profile.sync.device_id,
-        "clock": profile.next_clock(),
-        "timestamp": "",
-        "op": op.value,
-        "payload": payload,
-    }
-    event = build_signed_event(profile, op, payload, signature="")
+def _apply_signed_event(
+    profile: ORFProfile,
+    private_key: Ed25519PrivateKey,
+    op: EventOp,
+    payload: dict,
+    *,
+    timestamp: str | None = None,
+) -> None:
+    event = build_signed_event(profile, op, payload, signature="", timestamp=timestamp)
     signature = sign_payload(event.unsigned_payload(), private_key)
     event.signature = signature
     profile.apply_event(event)
+
+
+def create_event(profile: ORFProfile, private_key_path: Path, op: EventOp, payload: dict) -> None:
+    private_key = load_private_key(private_key_path)
+    _apply_signed_event(profile, private_key, op, payload)
+
+
+def _seed_slug(topic: str) -> str:
+    return topic.replace(":", "-").replace("/", "-")
+
+
+def _seed_title(topic: str) -> str:
+    _, _, path = topic.partition(":")
+    return path.replace("/", " / ").replace("-", " ").title()
+
+
+def _format_seed_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _phase_timestamps(
+    start_at: datetime,
+    end_at: datetime,
+    count: int,
+    rng: random.Random,
+    *,
+    jitter_minutes: int,
+) -> list[str]:
+    if count <= 0:
+        return []
+    if count == 1:
+        return [_format_seed_timestamp(start_at)]
+    total_seconds = max((end_at - start_at).total_seconds(), 1.0)
+    scheduled: list[datetime] = []
+    for index in range(count):
+        fraction = index / (count - 1)
+        anchor = start_at + timedelta(seconds=total_seconds * fraction)
+        jitter = timedelta(minutes=rng.randint(-jitter_minutes, jitter_minutes))
+        candidate = min(max(anchor + jitter, start_at), end_at)
+        scheduled.append(candidate.replace(microsecond=0))
+    scheduled.sort()
+    normalized: list[datetime] = []
+    last: datetime | None = None
+    for candidate in scheduled:
+        if last is not None and candidate <= last:
+            candidate = last + timedelta(seconds=1)
+        normalized.append(candidate)
+        last = candidate
+    return [_format_seed_timestamp(value) for value in normalized]
+
+
+def seed_profile(
+    profile: ORFProfile,
+    private_key: Ed25519PrivateKey,
+    *,
+    seed_value: int | None = None,
+    topic_count: int = DEFAULT_SEED_TOPIC_COUNT,
+    recommendation_count: int = DEFAULT_SEED_RECOMMENDATION_COUNT,
+    days: int = DEFAULT_SEED_ACTIVITY_DAYS,
+) -> dict[str, object]:
+    if topic_count <= 0:
+        raise ValueError("Topic count must be positive.")
+    if recommendation_count < 0:
+        raise ValueError("Recommendation count cannot be negative.")
+    if days <= 0:
+        raise ValueError("Days must be positive.")
+
+    resolved_seed = (
+        seed_value
+        if seed_value is not None
+        else random.SystemRandom().randrange(1, 2**31)
+    )
+    rng = random.Random(resolved_seed)
+    initial_event_count = len(profile.event_log)
+    end_at = datetime.now(timezone.utc).replace(microsecond=0)
+    start_at = end_at - timedelta(days=days)
+    onboarding_end = start_at + timedelta(days=max(2, min(days // 5, 6)))
+    recent_start = start_at + timedelta(days=max(4, days // 3))
+    topic_pool = list(SEED_TOPICS)
+    rng.shuffle(topic_pool)
+    selected_topics = topic_pool[: min(topic_count, len(topic_pool))]
+
+    public_count = max(3, len(selected_topics) // 3)
+    selective_count = max(3, len(selected_topics) // 3)
+    private_count = max(0, len(selected_topics) - public_count - selective_count)
+    visibility_order = (
+        ["public"] * public_count
+        + ["selective"] * selective_count
+        + ["private"] * private_count
+    )[: len(selected_topics)]
+    rng.shuffle(visibility_order)
+
+    seeded_topics: list[tuple[str, str]] = []
+    public_topics: list[str] = []
+    feed_topics: list[str] = []
+    topic_state: dict[str, dict[str, object]] = {}
+    initial_topic_timestamps = _phase_timestamps(
+        start_at,
+        onboarding_end,
+        len(selected_topics),
+        rng,
+        jitter_minutes=180,
+    )
+    for topic, visibility, timestamp in zip(
+        selected_topics,
+        visibility_order,
+        initial_topic_timestamps,
+        strict=False,
+    ):
+        weight = round(rng.uniform(0.35, 0.98), 2)
+        _apply_signed_event(
+            profile,
+            private_key,
+            EventOp.SET_TOPIC,
+            {"topic": topic, "weight": weight, "visibility": visibility},
+            timestamp=timestamp,
+        )
+        seeded_topics.append((topic, visibility))
+        topic_state[topic] = {"weight": weight, "visibility": visibility}
+        if visibility == "public":
+            public_topics.append(topic)
+            feed_topics.append(topic)
+        elif visibility == "selective":
+            feed_topics.append(topic)
+
+    opt_out_topics: list[str] = []
+    if public_topics:
+        opt_out_count = min(max(1, len(public_topics) // 4), len(public_topics))
+        opt_out_topics = sorted(rng.sample(public_topics, opt_out_count))
+        for topic, timestamp in zip(
+            opt_out_topics,
+            _phase_timestamps(start_at, recent_start, len(opt_out_topics), rng, jitter_minutes=240),
+            strict=False,
+        ):
+            _apply_signed_event(
+                profile,
+                private_key,
+                EventOp.SET_OPT_OUT,
+                {"topic": topic, "value": True},
+                timestamp=timestamp,
+            )
+
+    consent_values = {
+        "share_public_topics": True,
+        "ad_personalization": rng.choice([True, False]),
+        "hosted_sync": rng.choice([True, False]),
+    }
+    consent_timestamps = _phase_timestamps(
+        start_at,
+        recent_start,
+        len(consent_values),
+        rng,
+        jitter_minutes=300,
+    )
+    for (field_name, value), timestamp in zip(consent_values.items(), consent_timestamps, strict=False):
+        _apply_signed_event(
+            profile,
+            private_key,
+            EventOp.SET_CONSENT,
+            {"field": field_name, "value": value},
+            timestamp=timestamp,
+        )
+
+    topic_update_events_added = max(topic_count, days)
+    topic_update_timestamps = _phase_timestamps(
+        onboarding_end,
+        end_at,
+        topic_update_events_added,
+        rng,
+        jitter_minutes=360,
+    )
+    for timestamp in topic_update_timestamps:
+        topic = rng.choice(selected_topics)
+        state = topic_state[topic]
+        updated_weight = round(
+            min(0.99, max(0.2, float(state["weight"]) + rng.uniform(-0.18, 0.18))),
+            2,
+        )
+        state["weight"] = updated_weight
+        _apply_signed_event(
+            profile,
+            private_key,
+            EventOp.SET_TOPIC,
+            {
+                "topic": topic,
+                "weight": updated_weight,
+                "visibility": str(state["visibility"]),
+            },
+            timestamp=timestamp,
+        )
+
+    recommendation_events_added = 0
+    if recommendation_count > 0:
+        if not feed_topics:
+            feed_topics = selected_topics[:]
+        rng.shuffle(feed_topics)
+        recommendation_timestamps = _phase_timestamps(
+            recent_start,
+            end_at,
+            recommendation_count,
+            rng,
+            jitter_minutes=420,
+        )
+        item_index = 1
+        timestamp_index = 0
+        while recommendation_events_added < recommendation_count and timestamp_index < len(
+            recommendation_timestamps
+        ):
+            topic = feed_topics[(item_index - 1) % len(feed_topics)]
+            site_count = min(
+                recommendation_count - recommendation_events_added,
+                rng.randint(1, min(3, len(SEED_SITES))),
+            )
+            chosen_sites = rng.sample(SEED_SITES, site_count)
+            item_id = f"seed-{_seed_slug(topic)}-{item_index}"
+            for site_id, site_name in chosen_sites:
+                timestamp = recommendation_timestamps[timestamp_index]
+                _apply_signed_event(
+                    profile,
+                    private_key,
+                    EventOp.RECOMMEND,
+                    {
+                        "item_id": item_id,
+                        "site_id": site_id,
+                        "site_name": site_name,
+                        "score": round(rng.uniform(0.55, 0.98), 2),
+                        "reason": f"Seeded sample tied to {topic}.",
+                        "metadata": {
+                            "title": f"{_seed_title(topic)} Digest {item_index}",
+                            "topic": topic,
+                            "seeded": True,
+                        },
+                        "timestamp": timestamp,
+                    },
+                    timestamp=timestamp,
+                )
+                recommendation_events_added += 1
+                timestamp_index += 1
+                if recommendation_events_added >= recommendation_count:
+                    break
+            item_index += 1
+
+    visibility_counts = {
+        visibility: sum(1 for _, item_visibility in seeded_topics if item_visibility == visibility)
+        for visibility in ("public", "selective", "private")
+    }
+    seeded_events = profile.event_log[initial_event_count:]
+    total_events_added = len(seeded_events)
+    first_event_at = seeded_events[0].timestamp if seeded_events else None
+    last_event_at = seeded_events[-1].timestamp if seeded_events else None
+    if first_event_at is not None and first_event_at < profile.created_at:
+        profile.created_at = first_event_at
+    return {
+        "seed_value": resolved_seed,
+        "days_simulated": days,
+        "topics_added": len(seeded_topics),
+        "topic_update_events_added": topic_update_events_added,
+        "visibility_counts": visibility_counts,
+        "opt_outs_added": len(opt_out_topics),
+        "opt_out_topics": opt_out_topics,
+        "recommendation_events_added": recommendation_events_added,
+        "total_events_added": total_events_added,
+        "first_event_at": first_event_at,
+        "last_event_at": last_event_at,
+        "consent": consent_values,
+    }
 
 
 def command_create(args: argparse.Namespace) -> int:
     profile_path = Path(args.profile_path)
     key_path = private_key_path_for_profile(profile_path, args.key_path)
     private_key, public_key = generate_key_pair()
-    profile = ORFProfile.create(display_name=args.display_name, public_key=public_key, device_id=args.device_id)
+    profile = ORFProfile.create(
+        display_name=args.display_name,
+        public_key=public_key,
+        device_id=args.device_id,
+    )
+    seed_summary: dict[str, object] | None = None
+    if args.seed:
+        seed_summary = seed_profile(
+            profile,
+            private_key,
+            seed_value=args.seed_value,
+            topic_count=args.topic_count,
+            recommendation_count=args.recommendation_count,
+            days=args.days,
+        )
     save_profile(profile_path, profile)
     save_private_key(key_path, private_key, passphrase=args.passphrase)
-    print(
-        json.dumps(
-            {
-                "profile_path": str(profile_path),
-                "key_path": str(key_path),
-                "profile_id": profile.profile_id,
-            },
-            indent=2,
-        )
-    )
+    payload = {
+        "profile_path": str(profile_path),
+        "key_path": str(key_path),
+        "profile_id": profile.profile_id,
+    }
+    if seed_summary is not None:
+        payload["seed"] = seed_summary
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -294,7 +583,7 @@ def command_backup_restore(args: argparse.Namespace) -> int:
 
 def command_feed_show(args: argparse.Namespace) -> int:
     """Display aggregated cross-site recommendation feed."""
-    from .models import AggregatedFeed
+    from .recommender import AggregatedFeed
 
     profile_path = Path(args.profile_path)
     profile = load_profile(profile_path)
@@ -313,6 +602,35 @@ def command_feed_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_seed(args: argparse.Namespace) -> int:
+    profile_path = Path(args.profile_path)
+    key_path = private_key_path_for_profile(profile_path, args.key_path)
+    profile = load_profile(profile_path)
+    private_key = load_private_key(
+        key_path,
+        passphrase=args.key_passphrase,
+    )
+    if private_key_public_key_b64(private_key) != profile.public_key:
+        raise ValueError("The provided key does not match the profile public key.")
+    summary = seed_profile(
+        profile,
+        private_key,
+        seed_value=args.seed_value,
+        topic_count=args.topic_count,
+        recommendation_count=args.recommendation_count,
+        days=args.days,
+    )
+    save_profile(profile_path, profile)
+    print_json(
+        {
+            "profile_path": str(profile_path),
+            "profile_id": profile.profile_id,
+            "seed": summary,
+        }
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="open-recommender")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -323,7 +641,70 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--device-id", default="local-device")
     create_parser.add_argument("--key-path")
     create_parser.add_argument("--passphrase")
+    create_parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="Populate the new profile with randomized sample topics, consent, and recommendation events.",
+    )
+    create_parser.add_argument(
+        "--seed-value",
+        type=int,
+        help="Optional integer seed for reproducible sample data.",
+    )
+    create_parser.add_argument(
+        "--topic-count",
+        type=int,
+        default=DEFAULT_SEED_TOPIC_COUNT,
+        help=f"How many sample topics to add when seeding (default: {DEFAULT_SEED_TOPIC_COUNT}).",
+    )
+    create_parser.add_argument(
+        "--recommendation-count",
+        type=int,
+        default=DEFAULT_SEED_RECOMMENDATION_COUNT,
+        help=(
+            "How many seeded recommendation events to add when seeding "
+            f"(default: {DEFAULT_SEED_RECOMMENDATION_COUNT})."
+        ),
+    )
+    create_parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_SEED_ACTIVITY_DAYS,
+        help=f"How many days of activity to simulate when seeding (default: {DEFAULT_SEED_ACTIVITY_DAYS}).",
+    )
     create_parser.set_defaults(func=command_create)
+
+    seed_parser = subparsers.add_parser("seed")
+    seed_parser.add_argument("profile_path")
+    seed_parser.add_argument("--key-path")
+    seed_parser.add_argument("--key-passphrase")
+    seed_parser.add_argument(
+        "--seed-value",
+        type=int,
+        help="Optional integer seed for reproducible sample data.",
+    )
+    seed_parser.add_argument(
+        "--topic-count",
+        type=int,
+        default=DEFAULT_SEED_TOPIC_COUNT,
+        help=f"How many sample topics to add (default: {DEFAULT_SEED_TOPIC_COUNT}).",
+    )
+    seed_parser.add_argument(
+        "--recommendation-count",
+        type=int,
+        default=DEFAULT_SEED_RECOMMENDATION_COUNT,
+        help=(
+            "How many seeded recommendation events to add "
+            f"(default: {DEFAULT_SEED_RECOMMENDATION_COUNT})."
+        ),
+    )
+    seed_parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_SEED_ACTIVITY_DAYS,
+        help=f"How many days of activity to simulate (default: {DEFAULT_SEED_ACTIVITY_DAYS}).",
+    )
+    seed_parser.set_defaults(func=command_seed)
 
     topic_parser = subparsers.add_parser("topic-set")
     topic_parser.add_argument("profile_path")

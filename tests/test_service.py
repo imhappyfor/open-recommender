@@ -127,6 +127,32 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(verify_response.status_code, 200)
         self.assertTrue(verify_response.json()["verified"])
 
+    def test_challenge_verify_returns_explicit_error_for_bad_signature(self) -> None:
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+        challenge_response = self.client.post(f"/profiles/{self.profile.profile_id}/challenges")
+        challenge = challenge_response.json()
+
+        wrong_private_key, _ = generate_key_pair()
+        bad_signature = sign_payload(
+            {
+                "challenge_id": challenge["challenge_id"],
+                "profile_id": challenge["profile_id"],
+                "nonce": challenge["nonce"],
+                "created_at": challenge["created_at"],
+            },
+            wrong_private_key,
+        )
+
+        verify_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/challenge-response",
+            json={
+                "challenge_id": challenge["challenge_id"],
+                "signature": bad_signature,
+            },
+        )
+        self.assertEqual(verify_response.status_code, 400)
+        self.assertEqual(verify_response.json()["detail"], "Signature verification failed.")
+
     def test_demo_flow_personalizes_before_and_after_verification(self) -> None:
         self.signed_event(
             EventOp.SET_TOPIC,
@@ -276,6 +302,251 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(replay_response.status_code, 400)
         self.assertIn("already been used", replay_response.json()["detail"])
+
+    def test_grant_session_rank_reranks_without_leaking_profile_state(self) -> None:
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:media/podcasts", "weight": 0.7, "visibility": "selective"},
+        )
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
+        )
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:health/sleep", "weight": 0.5, "visibility": "private"},
+        )
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        request_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "requested_scopes": ["topics.selective:orf:media/podcasts"],
+            },
+        )
+        self.assertEqual(request_response.status_code, 200)
+        request_id = request_response.json()["access_request"]["request_id"]
+
+        approve_response = self.client.post(
+            f"/site-access-requests/{request_id}/approve",
+            json={"approved_scopes": ["topics.selective:orf:media/podcasts"]},
+        )
+        self.assertEqual(approve_response.status_code, 200)
+
+        exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
+        self.assertEqual(exchange_response.status_code, 200)
+        exchange_body = exchange_response.json()
+
+        verify_response = self.client.post(
+            f"/site-access-requests/{request_id}/verify",
+            json={
+                "challenge_id": exchange_body["challenge"]["challenge_id"],
+                "signature": sign_payload(
+                    exchange_body["challenge_payload"],
+                    self.private_key,
+                ),
+            },
+        )
+        self.assertEqual(verify_response.status_code, 200)
+        session_id = verify_response.json()["session"]["session_id"]
+
+        rank_response = self.client.post(
+            f"/grant-sessions/{session_id}/rank",
+            json={
+                "schema_version": "0.3.0",
+                "top_n": 2,
+                "include_debug": True,
+                "candidates": [
+                    {
+                        "candidate_id": "podcast-feature",
+                        "site_score": 0.7,
+                        "candidate_topics": ["orf:media/podcasts"],
+                        "metadata": {"slot": "hero"},
+                    },
+                    {
+                        "candidate_id": "tech-feature",
+                        "site_score": 0.8,
+                        "candidate_topics": ["orf:technology/python"],
+                        "metadata": {"slot": "secondary"},
+                    },
+                ],
+            },
+        )
+        self.assertEqual(rank_response.status_code, 200)
+        rank_body = rank_response.json()
+        ranking = rank_body["ranking"]
+        self.assertEqual(ranking["candidate_count"], 2)
+        self.assertEqual(ranking["top_n"], 2)
+        self.assertEqual(
+            [item["candidate_id"] for item in ranking["ranked_candidates"]],
+            ["podcast-feature", "tech-feature"],
+        )
+        self.assertEqual(ranking["ranked_candidates"][0]["metadata"], {"slot": "hero"})
+        self.assertIn("topic-affinity-strong", ranking["ranked_candidates"][0]["reason_codes"])
+        self.assertIn("topic-affinity-none", ranking["ranked_candidates"][1]["reason_codes"])
+        self.assertEqual(
+            sorted(ranking["ranked_candidates"][0]["breakdown"].keys()),
+            ["feedback_affinity", "freshness", "site_score", "topic_affinity"],
+        )
+        self.assertNotIn("topics", ranking)
+        self.assertNotIn("granted_scopes", ranking)
+        ranking_json = json.dumps(ranking, sort_keys=True)
+        self.assertNotIn("orf:media/podcasts", ranking_json)
+        self.assertNotIn("orf:technology/python", ranking_json)
+        self.assertNotIn("orf:health/sleep", ranking_json)
+        self.assertNotIn('"weight"', ranking_json)
+
+    def test_grant_session_feedback_changes_future_reranks_without_leaking_behavior(self) -> None:
+        self.signed_event(
+            EventOp.SET_TOPIC,
+            {"topic": "orf:media/podcasts", "weight": 0.7, "visibility": "selective"},
+        )
+        self.client.post("/profiles", json={"profile": self.profile.to_document()})
+
+        request_response = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={
+                "site_id": "open-news-demo",
+                "purpose": "Personalize the pilot site feed.",
+                "requested_scopes": ["topics.selective:orf:media/podcasts"],
+            },
+        )
+        self.assertEqual(request_response.status_code, 200)
+        request_id = request_response.json()["access_request"]["request_id"]
+
+        approve_response = self.client.post(
+            f"/site-access-requests/{request_id}/approve",
+            json={"approved_scopes": ["topics.selective:orf:media/podcasts"]},
+        )
+        self.assertEqual(approve_response.status_code, 200)
+
+        exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
+        self.assertEqual(exchange_response.status_code, 200)
+        exchange_body = exchange_response.json()
+
+        verify_response = self.client.post(
+            f"/site-access-requests/{request_id}/verify",
+            json={
+                "challenge_id": exchange_body["challenge"]["challenge_id"],
+                "signature": sign_payload(
+                    exchange_body["challenge_payload"],
+                    self.private_key,
+                ),
+            },
+        )
+        self.assertEqual(verify_response.status_code, 200)
+        session_id = verify_response.json()["session"]["session_id"]
+
+        candidate_payload = {
+            "schema_version": "0.3.0",
+            "top_n": 2,
+            "include_debug": True,
+            "candidates": [
+                {
+                    "candidate_id": "podcast-feature",
+                    "site_score": 0.55,
+                    "candidate_topics": ["orf:media/podcasts"],
+                },
+                {
+                    "candidate_id": "tech-feature",
+                    "site_score": 0.81,
+                    "candidate_topics": ["orf:technology/python"],
+                },
+            ],
+        }
+        initial_rank_response = self.client.post(
+            f"/grant-sessions/{session_id}/rank",
+            json=candidate_payload,
+        )
+        self.assertEqual(initial_rank_response.status_code, 200)
+        self.assertEqual(
+            [
+                item["candidate_id"]
+                for item in initial_rank_response.json()["ranking"]["ranked_candidates"]
+            ],
+            ["podcast-feature", "tech-feature"],
+        )
+
+        feedback_response = self.client.post(
+            f"/grant-sessions/{session_id}/rank/feedback",
+            json={
+                "schema_version": "0.3.0",
+                "events": [
+                    {
+                        "event_id": "feedback-1",
+                        "event_type": "dismiss",
+                        "candidate_id": "podcast-feature",
+                        "candidate_topics": ["orf:media/podcasts"],
+                        "occurred_at": "2025-01-21T10:00:00+00:00",
+                    },
+                    {
+                        "event_id": "feedback-2",
+                        "event_type": "save",
+                        "candidate_id": "tech-feature",
+                        "candidate_topics": ["orf:technology/python"],
+                        "occurred_at": "2025-01-21T10:01:00+00:00",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(feedback_response.status_code, 200)
+        feedback_body = feedback_response.json()["feedback"]
+        self.assertEqual(feedback_body["submitted_events"], 2)
+        self.assertEqual(feedback_body["accepted_events"], 2)
+
+        duplicate_feedback_response = self.client.post(
+            f"/grant-sessions/{session_id}/rank/feedback",
+            json={
+                "schema_version": "0.3.0",
+                "events": [
+                    {
+                        "event_id": "feedback-1",
+                        "event_type": "dismiss",
+                        "candidate_id": "podcast-feature",
+                        "candidate_topics": ["orf:media/podcasts"],
+                        "occurred_at": "2025-01-21T10:00:00+00:00",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(duplicate_feedback_response.status_code, 200)
+        self.assertEqual(
+            duplicate_feedback_response.json()["feedback"]["accepted_events"],
+            0,
+        )
+
+        rerank_response = self.client.post(
+            f"/grant-sessions/{session_id}/rank",
+            json=candidate_payload,
+        )
+        self.assertEqual(rerank_response.status_code, 200)
+        reranked_candidates = rerank_response.json()["ranking"]["ranked_candidates"]
+        self.assertEqual(
+            [item["candidate_id"] for item in reranked_candidates],
+            ["tech-feature", "podcast-feature"],
+        )
+        self.assertIn("feedback-positive", reranked_candidates[0]["reason_codes"])
+        self.assertIn("feedback-negative", reranked_candidates[1]["reason_codes"])
+
+        ranking_json = json.dumps(rerank_response.json()["ranking"], sort_keys=True)
+        self.assertNotIn("feedback-1", ranking_json)
+        self.assertNotIn("feedback-2", ranking_json)
+        self.assertNotIn("orf:media/podcasts", ranking_json)
+        self.assertNotIn("orf:technology/python", ranking_json)
+
+        admin_client = TestClient(create_app(self.db_path, admin_token="secret-token"))
+        audit_response = admin_client.get(
+            f"/admin/audit-events?event_type=ranking-feedback.ingested&session_id={session_id}",
+            headers={"X-Open-Recommender-Admin-Token": "secret-token"},
+        )
+        self.assertEqual(audit_response.status_code, 200)
+        events = audit_response.json()["events"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(sorted(item["accepted_events"] for item in events), [0, 2])
+        self.assertIn(["dismiss", "save"], [item["feedback_types"] for item in events])
+        self.assertNotIn("candidate_id", json.dumps(events, sort_keys=True))
 
     def test_site_access_request_supports_required_and_optional_scopes(self) -> None:
         self.signed_event(
@@ -835,6 +1106,9 @@ class ServiceTests(unittest.TestCase):
         grants_page = admin_client.get("/consent/grants")
         self.assertEqual(grants_page.status_code, 200)
         self.assertIn("Site Grants", grants_page.text)
+        self.assertIn("try {", grants_page.text)
+        self.assertIn("catch (error)", grants_page.text)
+        self.assertIn("Grant revoke failed with HTTP", grants_page.text)
         token_match = re.search(
             rf"data-grant-id='{re.escape(grant_id)}' data-csrf-token='([^']+)'",
             grants_page.text,

@@ -32,4 +32,7 @@ The feed preserves source attribution so users can see which sites contributed.
 
 The feed is computed locally from the profile event log. It does not require a separate feed database or a hidden ranking service.
 
+The current implementation lives in `src/open_recommender/recommender/feed.py`.
+Legacy imports remain re-exported from `open_recommender.models` for compatibility.
+
 For the lower-level implementation details, see `docs/aggregated-feed-design.md`.

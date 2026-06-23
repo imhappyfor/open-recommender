@@ -60,7 +60,9 @@ async function readJson(req) {
 
 function createMockOrfApi() {
   const requests = new Map();
+  const sessions = new Map();
   let nextId = 1;
+  let nextSessionId = 1;
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", SERVICE_URL);
@@ -280,15 +282,26 @@ function createMockOrfApi() {
     }
 
     if (req.method === "POST" && url.pathname.match(/^\/site-access-requests\/[^/]+\/verify$/)) {
+      const requestId = decodeURIComponent(url.pathname.split("/")[2]);
+      const record = requests.get(requestId);
+      if (!record) {
+        jsonResponse(res, 404, { detail: "Request not found." }, origin);
+        return;
+      }
+      const sessionId = `session-${nextSessionId++}`;
+      sessions.set(sessionId, {
+        requestId,
+        approvedScopes: record.access_request.approved_scopes ?? [],
+      });
       jsonResponse(res, 200, {
         verified: true,
         grant: {
           grant_id: "grant-1",
-          request_id: "request-1",
-          approved_scopes: ["profile.read", "topics.public"],
+          request_id: requestId,
+          approved_scopes: record.access_request.approved_scopes ?? [],
         },
         session: {
-          session_id: "session-1",
+          session_id: sessionId,
         },
       }, origin);
       return;
@@ -301,6 +314,61 @@ function createMockOrfApi() {
           grant_id: "grant-1",
           display_name: "Alice Example",
           topics: [{ topic: "orf:technology/python", visibility: "public" }],
+        },
+      }, origin);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname.match(/^\/grant-sessions\/[^/]+\/rank$/)) {
+      const sessionId = decodeURIComponent(url.pathname.split("/")[2]);
+      const session = sessions.get(sessionId);
+      if (!session) {
+        jsonResponse(res, 404, { detail: "Grant session not found." }, origin);
+        return;
+      }
+      const body = await readJson(req);
+      const approvedScopes = new Set(session.approvedScopes ?? []);
+      const requestedCandidates = Array.isArray(body.candidates) ? body.candidates : [];
+      const rankedCandidates = requestedCandidates
+        .map((candidate) => {
+          const candidateTopics = Array.isArray(candidate.candidate_topics) ? candidate.candidate_topics : [];
+          const matchedTopics = candidateTopics.filter((topic) => (
+            (approvedScopes.has("topics.public") && topic === "orf:technology/python")
+            || approvedScopes.has(`topics.selective:${topic}`)
+          ));
+          const affinity = matchedTopics.length > 0 ? 0.25 : 0.0;
+          const score = Number(candidate.site_score ?? 0) + affinity;
+          return {
+            candidate_id: candidate.candidate_id,
+            score,
+            rank: 0,
+            reason_codes: matchedTopics.length > 0
+              ? ["topic-affinity-strong"]
+              : ["topic-affinity-none"],
+            metadata: candidate.metadata ?? {},
+          };
+        })
+        .sort((left, right) => (
+          right.score - left.score || String(left.candidate_id).localeCompare(String(right.candidate_id))
+        ))
+        .map((candidate, index) => ({
+          ...candidate,
+          rank: index + 1,
+          score: Number(candidate.score.toFixed(6)),
+        }));
+      const topN = Math.min(Number(body.top_n ?? rankedCandidates.length), rankedCandidates.length);
+      jsonResponse(res, 200, {
+        session: {
+          session_id: sessionId,
+        },
+        ranking: {
+          schema_version: body.schema_version ?? "0.3.0",
+          site_id: "open-news-demo",
+          grant_id: "grant-1",
+          candidate_count: rankedCandidates.length,
+          top_n: topN,
+          reranked_at: "2026-05-23T00:00:00Z",
+          ranked_candidates: rankedCandidates.slice(0, topN),
         },
       }, origin);
       return;
@@ -407,9 +475,21 @@ async function main() {
 
     await page.locator("#start-exchange").click();
     await page.waitForSelector("#projection-card");
+    await page.waitForSelector("#ranking-card");
     assert.match(
       await page.$eval("#projection-card", (node) => node.textContent ?? ""),
       /Alice Example/,
+    );
+    await page.waitForFunction(
+      () => document.querySelector("#ranked-candidate-list li strong")?.textContent?.includes("Podcast spotlight"),
+    );
+    assert.match(
+      await page.$eval("#ranked-candidate-list", (node) => node.textContent ?? ""),
+      /Podcast spotlight: interviews worth queueing/,
+    );
+    assert.doesNotMatch(
+      await page.$eval("#ranking-card", (node) => node.textContent ?? ""),
+      /orf:media\/podcasts|orf:technology\/python/,
     );
 
     assert.deepEqual(consoleErrors, []);

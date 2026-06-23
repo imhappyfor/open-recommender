@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -89,5 +90,8 @@ def sign_payload(payload: dict[str, Any], private_key: Ed25519PrivateKey) -> str
 
 def verify_signature(payload: dict[str, Any], signature_b64: str, public_key_b64: str) -> bool:
     public_key = Ed25519PublicKey.from_public_bytes(decode_bytes(public_key_b64))
-    public_key.verify(decode_bytes(signature_b64), canonical_json(payload))
+    try:
+        public_key.verify(decode_bytes(signature_b64), canonical_json(payload))
+    except InvalidSignature as error:
+        raise ValueError("Signature verification failed.") from error
     return True

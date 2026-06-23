@@ -6,6 +6,10 @@ The `AggregatedFeed` class reads events from a user's `.orf` file (synced across
 
 **Key design principle:** Feed aggregation is stateless. It reads from event logs only; no side effects, no external service calls needed.
 
+The current reference implementation lives in `src/open_recommender/recommender/feed.py`.
+For compatibility, `open_recommender.models` re-exports the recommender classes used by
+older callers and tests.
+
 ---
 
 ## 1. Class Structure & Data Holding

@@ -10,6 +10,55 @@ const DEFAULT_SERVICE_URL = "http://127.0.0.1:8000";
 const DEFAULT_SITE_ID = "open-news-demo";
 const DEFAULT_REQUIRED_SCOPES = ["profile.read", "topics.public"];
 const DEFAULT_OPTIONAL_SCOPES = ["topics.selective:orf:media/podcasts"];
+const DEMO_RANKING_CANDIDATES = [
+  {
+    candidateId: "podcast-spotlight",
+    siteScore: 0.8,
+    candidateTopics: ["orf:media/podcasts"],
+    metadata: {
+      headline: "Podcast spotlight: interviews worth queueing",
+      slot: "hero",
+      surface: "sample-feed",
+    },
+  },
+  {
+    candidateId: "python-roundup",
+    siteScore: 0.74,
+    candidateTopics: ["orf:technology/python"],
+    metadata: {
+      headline: "Python roundup for builders",
+      slot: "secondary",
+      surface: "sample-feed",
+    },
+  },
+  {
+    candidateId: "privacy-briefing",
+    siteScore: 0.71,
+    candidateTopics: ["orf:policy/privacy"],
+    metadata: {
+      headline: "Privacy briefing for the week",
+      slot: "tertiary",
+      surface: "sample-feed",
+    },
+  },
+];
+
+function buildDemoRankingCandidates() {
+  return DEMO_RANKING_CANDIDATES.map((candidate) => ({
+    candidate_id: candidate.candidateId,
+    site_score: candidate.siteScore,
+    candidate_topics: candidate.candidateTopics,
+    metadata: candidate.metadata,
+  }));
+}
+
+function browserSigninErrorMessage(err) {
+  const wrapped = wrapError(err);
+  if (err instanceof ORFClientError && err.status === 400 && err.detail === "Signature verification failed.") {
+    return "Could not complete browser sign-in. The uploaded .orf.key does not match this profile, or the challenge is stale. Refresh the request status, start a new exchange, and try again.";
+  }
+  return `Could not complete browser sign-in. Make sure the uploaded .orf.key matches this profile. ${wrapped}`;
+}
 
 function pemToPkcs8Bytes(pemText) {
   const normalized = pemText.replace(/\r/g, "").trim();
@@ -35,6 +84,74 @@ async function importBrowserSigningKey(pemText) {
     { name: "Ed25519" },
     false,
     ["sign"],
+  );
+}
+
+function RankingCard({ ranking, rankingError, onRank, loading }) {
+  const rankingPayload = ranking?.ranking ?? null;
+  const rankedCandidates = rankingPayload?.ranked_candidates ?? [];
+
+  return (
+    <div id="ranking-card" className="card" style={{ marginTop: 14 }}>
+      <h2>Site reranking demo</h2>
+      <p className="muted">
+        This uses the verified grant session to rerank a fixed set of site-owned candidates. The UI
+        only shows the ranking payload returned by the service plus site metadata echoed back per
+        candidate.
+      </p>
+
+      <div style={{ marginTop: 16 }}>
+        <h3>Sample site candidates</h3>
+        <ul id="ranking-source-candidates">
+          {DEMO_RANKING_CANDIDATES.map((candidate) => (
+            <li key={candidate.candidateId}>
+              <strong>{candidate.metadata.headline}</strong>
+              <span className="muted">
+                {" "}
+                — site score {candidate.siteScore.toFixed(2)} · slot {candidate.metadata.slot}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <button id="rerank-candidates" onClick={onRank} disabled={loading}>
+        {loading ? "Reranking…" : "Rerank sample feed"}
+      </button>
+
+      {rankingError && (
+        <div className="banner banner-error" style={{ marginTop: 14 }}>
+          <strong>Ranking failed:</strong> {rankingError}
+        </div>
+      )}
+
+      {rankingPayload && (
+        <div style={{ marginTop: 16 }}>
+          <p className="muted">
+            Grant session <code>{ranking.session?.session_id}</code> returned{" "}
+            {rankedCandidates.length} of {rankingPayload.candidate_count} candidates.
+          </p>
+          <ol id="ranked-candidate-list">
+            {rankedCandidates.map((candidate) => (
+              <li key={candidate.candidate_id} style={{ marginBottom: 12 }}>
+                <strong>{candidate.metadata?.headline ?? candidate.candidate_id}</strong>
+                <div className="muted">
+                  Score {candidate.score.toFixed(3)} · rank {candidate.rank}
+                  {candidate.metadata?.slot ? ` · slot ${candidate.metadata.slot}` : ""}
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
+                  {(candidate.reason_codes ?? []).map((reasonCode) => (
+                    <span key={reasonCode} className="scope-tag">
+                      {reasonCode}
+                    </span>
+                  ))}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -101,7 +218,15 @@ function ProjectionCard({ projection }) {
   );
 }
 
-function RequestCard({ requestData, consentUrl, onRefresh, onExchange, loading, hasInlineConsent }) {
+function RequestCard({
+  requestData,
+  consentUrl,
+  onRefresh,
+  onExchange,
+  loading,
+  hasInlineConsent,
+  hasSigningKey,
+}) {
   if (!requestData) return null;
   const ar = requestData.access_request ?? requestData;
   const status = ar.status;
@@ -144,13 +269,20 @@ function RequestCard({ requestData, consentUrl, onRefresh, onExchange, loading, 
         <div className="banner banner-info" style={{ marginTop: 14 }}>
           <p style={{ margin: "0 0 8px" }}>
             {hasInlineConsent
-              ? "Approve or deny below, or open the separate consent page if you want the dedicated localhost review view."
+              ? "Approve or deny below in this tab. The separate localhost review page is optional and not needed for the normal browser flow."
               : "The request is waiting for the user to approve it in the ORF trust app."}
           </p>
+          {hasInlineConsent && hasSigningKey && (
+            <p style={{ margin: "0 0 8px" }}>
+              <strong>Heads up:</strong> you already loaded the local <code>.orf.key</code>, so
+              after approval this tab can continue through signing and projection without opening
+              the separate localhost review page.
+            </p>
+          )}
           {consentUrl && (
             <p style={{ margin: "0 0 8px" }}>
               <a id="consent-review-link" href={consentUrl} target="_blank" rel="noreferrer">
-                Open consent review →
+                Open separate localhost review page (optional) →
               </a>
             </p>
           )}
@@ -246,8 +378,8 @@ function ConsentCard({
     <div id="inline-consent-card" className="card" style={{ marginTop: 14 }}>
       <h2>Consent review</h2>
       <p className="muted">
-        This is the same localhost trust decision as the separate consent page, rendered inline so
-        the browser flow behaves more like a real third-party sign-in.
+        This inline card is the default browser flow. The separate localhost review page is only an
+        optional inspection view if you want to see the dedicated trust surface.
       </p>
       <p>
         <strong>Site:</strong> {reviewData.access_request?.site_name}
@@ -316,6 +448,8 @@ export default function App() {
   const [requestData, setRequestData] = useState(null);
   const [consentUrl, setConsentUrl] = useState(null);
   const [projection, setProjection] = useState(null);
+  const [ranking, setRanking] = useState(null);
+  const [rankingError, setRankingError] = useState(null);
   const [flowStatus, setFlowStatus] = useState("idle");
   const [consentReview, setConsentReview] = useState(null);
   const [selectedScopes, setSelectedScopes] = useState([]);
@@ -422,6 +556,8 @@ export default function App() {
     const cleanedProfileId = profileId.trim();
     setError(null);
     setProjection(null);
+    setRanking(null);
+    setRankingError(null);
     setRequestData(null);
     setConsentReview(null);
     setSelectedScopes([]);
@@ -530,16 +666,48 @@ export default function App() {
       const projectionResult = await getClient().getProjection(verified.session.session_id);
       setProjection(projectionResult);
       setRequestData((prev) => ({ ...prev, _exchange: activeExchange, _verified: verified }));
+      setRankingError(null);
+      setRanking(null);
       setFlowStatus("done");
+      try {
+        const rankingResult = await getClient().rankCandidates(verified.session.session_id, {
+          topN: DEMO_RANKING_CANDIDATES.length,
+          candidates: buildDemoRankingCandidates(),
+        });
+        setRanking(rankingResult);
+      } catch (rankErr) {
+        setRankingError(wrapError(rankErr));
+      }
     } catch (err) {
-      setError(
-        `Could not complete browser sign-in. Make sure the uploaded .orf.key matches this profile. ${wrapError(err)}`,
-      );
+      setError(browserSigninErrorMessage(err));
       setFlowStatus("awaiting-signature");
     } finally {
       setLoading(false);
     }
-  }, [requestData, signingKey, serviceUrl]);
+  }, [requestData, serviceUrl, signingKey]);
+
+  const handleRerank = useCallback(async () => {
+    const sessionId =
+      requestData?._verified?.session?.session_id ?? projection?.session?.session_id ?? null;
+    if (!sessionId) {
+      return;
+    }
+
+    setError(null);
+    setRankingError(null);
+    setLoading(true);
+    try {
+      const rankingResult = await getClient().rankCandidates(sessionId, {
+        topN: DEMO_RANKING_CANDIDATES.length,
+        candidates: buildDemoRankingCandidates(),
+      });
+      setRanking(rankingResult);
+    } catch (err) {
+      setRankingError(wrapError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [projection, requestData, serviceUrl]);
 
   const handleExchange = useCallback(async () => {
     if (!requestData) return;
@@ -568,9 +736,6 @@ export default function App() {
       current.includes(scope) ? current.filter((item) => item !== scope) : [...current, scope],
     );
   }, []);
-
-  const requestId =
-    requestData?.access_request?.request_id ?? requestData?.request_id ?? null;
 
   return (
     <main>
@@ -694,6 +859,7 @@ export default function App() {
           onExchange={handleExchange}
           loading={loading}
           hasInlineConsent={Boolean(consentReview)}
+          hasSigningKey={Boolean(signingKey)}
         />
       )}
 
@@ -750,6 +916,14 @@ export default function App() {
       )}
 
       {projection && <ProjectionCard projection={projection} />}
+      {projection && (
+        <RankingCard
+          ranking={ranking}
+          rankingError={rankingError}
+          onRank={handleRerank}
+          loading={loading && Boolean(projection)}
+        />
+      )}
 
       <div className="card" style={{ marginTop: 14 }}>
         <h2>Role split in this localhost demo</h2>
@@ -761,7 +935,8 @@ export default function App() {
           </li>
           <li>
             <strong>ORF service</strong> — stores registered profiles, persists grants, reuses valid
-            grants, and enforces consented projections.
+            grants, enforces consented projections, and reranks site candidates inside the verified
+            grant-session boundary.
           </li>
           <li>
             <strong>User-side signer</strong> — in this demo, that signer can live in the same

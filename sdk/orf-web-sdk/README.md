@@ -57,6 +57,26 @@ const verified = await client.verifySignature({
 // 7. Read the consented projection
 const projection = await client.getProjection(verified.session.session_id);
 console.log(projection.projection.topics);
+
+// 8. Rerank site-owned candidates inside the verified grant session
+const ranking = await client.rankCandidates(verified.session.session_id, {
+  topN: 2,
+  candidates: [
+    {
+      candidate_id: "story-123",
+      site_score: 0.78,
+      candidate_topics: ["orf:media/podcasts"],
+      metadata: { slot: "hero" },
+    },
+    {
+      candidate_id: "story-456",
+      site_score: 0.81,
+      candidate_topics: ["orf:technology/python"],
+      metadata: { slot: "secondary" },
+    },
+  ],
+});
+console.log(ranking.ranking.ranked_candidates);
 ```
 
 ## API
@@ -81,6 +101,7 @@ console.log(projection.projection.topics);
 | `startExchange(requestId)` | Begin the challenge exchange (request must be approved) |
 | `verifySignature({ requestId, challengeId, signature, sessionExpiresAt? })` | Verify the signed challenge to get a grant session |
 | `getProjection(sessionId)` | Fetch the consented projection |
+| `rankCandidates(sessionId, { candidates, topN?, includeDebug?, schemaVersion? })` | Rerank site-generated candidates inside a verified grant session |
 | `getPublicProfile(profileId)` | Read the public profile (no auth) |
 | `pushEvents(profileId, events)` | Push signed sync events |
 | `pullEvents(profileId, { afterClock? })` | Pull sync events since a clock value |

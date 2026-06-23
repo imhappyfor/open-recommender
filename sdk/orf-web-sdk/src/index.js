@@ -206,6 +206,26 @@ export class ORFClient {
   }
 
   /**
+   * Rerank site-generated candidates inside a verified grant session.
+   * @param {string} sessionId
+   * @param {{ candidates: Array<object>, topN?: number, includeDebug?: boolean, schemaVersion?: string }} params
+   * @returns {Promise<object>}  { session, ranking }
+   */
+  async rankCandidates(sessionId, { candidates, topN, includeDebug = false, schemaVersion } = {}) {
+    const body = {
+      candidates,
+      include_debug: includeDebug,
+    };
+    if (topN !== undefined) {
+      body.top_n = topN;
+    }
+    if (schemaVersion) {
+      body.schema_version = schemaVersion;
+    }
+    return this._request("POST", `/grant-sessions/${sessionId}/rank`, body);
+  }
+
+  /**
    * Read consent review data for a pending request from the localhost trust surface.
    * @param {string} requestId
    * @returns {Promise<object>}

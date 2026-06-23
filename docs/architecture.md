@@ -18,12 +18,13 @@ The `.orf` file serves three functions:
 
 ## High-level architecture
 
-The project has four main runtime pieces:
+The project has five main runtime pieces:
 
 1. **ORF profile model** in `models.py`
-2. **Ed25519 crypto utilities** in `crypto.py`
-3. **Hosted FastAPI service** in `service.py`
-4. **SQLite persistence layer** in `store.py`
+2. **Recommendation aggregation** in `recommender/feed.py`
+3. **Ed25519 crypto utilities** in `crypto.py`
+4. **Hosted FastAPI service** in `service.py`
+5. **SQLite persistence layer** in `store.py`
 
 The CLI in `cli.py` ties those pieces together for local creation, editing, export, and sync.
 
@@ -144,6 +145,13 @@ The repo includes compatibility helpers that define the contract behavior:
 
 This keeps the contract narrow while still allowing additive fields in later minor revisions.
 
+## Local recommender feed
+
+Cross-site recommendation aggregation now lives in `src/open_recommender/recommender/feed.py`.
+The reference implementation keeps legacy imports available from `open_recommender.models`
+so existing callers can continue importing `AggregatedFeed`,
+`AggregatedRecommendation`, and `RecommendationItem` without changes.
+
 ## Signing model
 
 The crypto layer provides:
@@ -185,6 +193,8 @@ The server verifies those signatures before accepting events.
 - `POST /site-access-requests/{request_id}/exchange` — start the grant exchange challenge
 - `POST /site-access-requests/{request_id}/verify` — verify the exchange challenge and mint a grant session
 - `GET /grant-sessions/{session_id}/projection` — read the consented projection for a verified session
+- `POST /grant-sessions/{session_id}/rank` — rerank site-generated candidates within the verified grant-session boundary
+- `POST /grant-sessions/{session_id}/rank/feedback` — ingest explicit site-local ranking outcomes scoped to that grant
 - `GET /demo/site/{profile_id}` — build an immediate personalization preview from public profile data
 - `POST /demo/site/{profile_id}/challenge` — create a demo challenge and return personalization preview plus challenge payload
 - `POST /demo/site/{profile_id}/verify` — verify proof of control and return a verified portable-profile session response
@@ -204,6 +214,7 @@ Operational guardrails in the current reference service:
 
 - auth-sensitive routes use per-client fixed-window rate limiting
 - admin inspection routes are disabled unless an admin token is configured
+- ranking feedback is stored in a service-side table keyed by grant/session and is never written into the ORF document
 - audit records are written for request lifecycle changes, challenge issuance and verification, grant sessions, and projection reads
 
 ### Challenge flow

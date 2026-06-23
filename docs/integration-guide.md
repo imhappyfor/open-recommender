@@ -10,6 +10,7 @@ This guide shows how a site integrates with Open Recommender using the browser S
 4. Start the exchange and receive `challenge_payload`.
 5. Let the user's ORF client sign that payload with the private key.
 6. Verify the signature and fetch the consented projection.
+7. Optionally rerank site-generated candidates inside the verified grant session.
 
 ## Browser SDK
 
@@ -25,17 +26,29 @@ const created = await client.createAccessRequest({
   purpose: "Personalize the feed.",
   requestedScopes: ["profile.read", "topics.public"],
 });
+
+const ranking = await client.rankCandidates("grant-session-id", {
+  candidates: [
+    {
+      candidate_id: "story-123",
+      site_score: 0.78,
+      candidate_topics: ["orf:media/podcasts"],
+    },
+  ],
+});
 ```
 
 ## Python partner SDK
 
 For server-side integration code, use `open_recommender.partner_sdk.PartnerClient`.
-It exposes the same request, exchange, verify, projection, and sync operations.
+It exposes the same request, exchange, verify, projection, reranking, and sync operations.
 
 ## Scope boundary
 
 - The site never holds the user's ORF private key.
 - `challenge_payload` must be signed by the user's own client.
 - Public projections only include the scopes the user approved.
+- Grant-session ranking uses those approved signals internally but does not expose raw profile topics or
+  topic weights in the response.
 
 See `docs/pilot-integration.md` for the localhost reference flow and `sdk/README.md` for the browser SDK quick start.

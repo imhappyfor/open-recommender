@@ -50,6 +50,7 @@ Supported operations:
 - begin exchange
 - verify challenge signature
 - fetch consented projection
+- rerank site-generated candidates inside a verified grant session
 
 Example:
 
@@ -284,7 +285,110 @@ The projection never includes:
 - unapproved selective topics
 - data outside the session's approved scope set
 
-## 6. Pilot-safe guardrails in the reference service
+## 6. Site reranks candidates inside the grant session
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "0.3.0",
+    "top_n": 2,
+    "include_debug": false,
+    "candidates": [
+      {
+        "candidate_id": "story-123",
+        "site_score": 0.78,
+        "candidate_topics": ["orf:media/podcasts"],
+        "metadata": {"slot": "hero"}
+      },
+      {
+        "candidate_id": "story-456",
+        "site_score": 0.81,
+        "candidate_topics": ["orf:technology/python"]
+      }
+    ]
+  }'
+```
+
+Or through the Python SDK:
+
+```python
+ranking = sdk.rank_candidates(
+    session_id,
+    top_n=2,
+    candidates=[
+        {
+            "candidate_id": "story-123",
+            "site_score": 0.78,
+            "candidate_topics": ["orf:media/podcasts"],
+        },
+        {
+            "candidate_id": "story-456",
+            "site_score": 0.81,
+            "candidate_topics": ["orf:technology/python"],
+        },
+    ],
+)
+```
+
+Important boundary:
+
+- this is reranking only, not candidate generation
+- the verified grant session is still the trust boundary; there is no new ranking scope in v1
+- the response returns candidate scores, reason codes, and optional coarse debug breakdowns only
+- raw profile topics and topic weights are not exposed in the ranking response
+- site-provided `metadata` is echoed back so the caller can map ranked results to its own feed objects
+
+## 7. Site records explicit ranking feedback
+
+If the site wants later reranks for the same grant to reflect explicit outcomes, it can post a
+small service-local feedback event set:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "0.3.0",
+    "events": [
+      {
+        "event_id": "feedback-1",
+        "event_type": "click",
+        "candidate_id": "story-123",
+        "candidate_topics": ["orf:media/podcasts"],
+        "occurred_at": "2025-01-21T10:00:00+00:00"
+      }
+    ]
+  }'
+```
+
+Or through the Python SDK:
+
+```python
+feedback = sdk.record_ranking_feedback(
+    session_id,
+    events=[
+        {
+            "event_id": "feedback-1",
+            "event_type": "click",
+            "candidate_id": "story-123",
+            "candidate_topics": ["orf:media/podcasts"],
+            "occurred_at": "2025-01-21T10:00:00+00:00",
+        }
+    ],
+)
+```
+
+Current feedback types are intentionally narrow: `click`, `dismiss`, and `save`.
+
+Important boundary:
+
+- feedback stays service-local and scoped to the site grant
+- `event_id` is the caller-generated dedupe key, so retried submissions stay idempotent
+- feedback improves future `/rank` calls for that same grant; it is not a portable ORF signal
+- raw feedback events are not returned from `/projection` or `/rank`
+- audit records capture submission counts and feedback types, not raw candidate IDs
+
+## 7. Pilot-safe guardrails in the reference service
 
 Current guardrails:
 
@@ -312,7 +416,7 @@ curl -s -H "X-Open-Recommender-Admin-Token: dev-admin-token" \
   "http://127.0.0.1:8000/admin/audit-events?limit=20"
 ```
 
-## 7. What this flow proves
+## 8. What this flow proves
 
 This pilot flow proves that Open Recommender can:
 
@@ -322,7 +426,7 @@ This pilot flow proves that Open Recommender can:
 - limit the shared projection to what the user actually approved
 - give the operator a small audit surface for pilot debugging
 
-## 8. Revoke future reuse
+## 9. Revoke future reuse
 
 From the localhost trust app, open:
 

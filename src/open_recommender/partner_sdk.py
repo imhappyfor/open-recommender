@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib import error, request
 
+from .models import CURRENT_CONTRACT_SCHEMA_VERSION
+
 
 JsonSender = Callable[[str, str, dict[str, Any] | None], dict[str, Any]]
 
@@ -144,6 +146,39 @@ class PartnerClient:
 
     def get_projection(self, session_id: str) -> dict[str, Any]:
         return self._request("GET", f"/grant-sessions/{session_id}/projection")
+
+    def rank_candidates(
+        self,
+        session_id: str,
+        *,
+        candidates: list[dict[str, Any]],
+        top_n: int | None = None,
+        include_debug: bool = False,
+        schema_version: str = CURRENT_CONTRACT_SCHEMA_VERSION,
+    ) -> dict[str, Any]:
+        """Rerank site candidates inside an approved grant-session boundary."""
+        payload: dict[str, Any] = {
+            "schema_version": schema_version,
+            "include_debug": include_debug,
+            "candidates": candidates,
+        }
+        if top_n is not None:
+            payload["top_n"] = top_n
+        return self._request("POST", f"/grant-sessions/{session_id}/rank", payload)
+
+    def record_ranking_feedback(
+        self,
+        session_id: str,
+        *,
+        events: list[dict[str, Any]],
+        schema_version: str = CURRENT_CONTRACT_SCHEMA_VERSION,
+    ) -> dict[str, Any]:
+        """Record site-local ranking outcomes for future reranks on the same grant."""
+        payload: dict[str, Any] = {
+            "schema_version": schema_version,
+            "events": events,
+        }
+        return self._request("POST", f"/grant-sessions/{session_id}/rank/feedback", payload)
 
     def push_events(self, profile_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         """Push signed events to the hosted sync store.

@@ -155,6 +155,8 @@ Useful endpoints:
 - `POST /site-access-requests/{request_id}/exchange`
 - `POST /site-access-requests/{request_id}/verify`
 - `GET /grant-sessions/{session_id}/projection`
+- `POST /grant-sessions/{session_id}/rank`
+- `POST /grant-sessions/{session_id}/rank/feedback`
 - `GET /consent`
 - `GET /consent/grants`
 - `GET /consent/site-access-requests/{request_id}`
@@ -327,6 +329,53 @@ Once the service returns a verified `session_id`, you can inspect the consented 
 ```bash
 python -m open_recommender.cli grant-session-projection <session_id> http://127.0.0.1:8000
 ```
+
+Or rerank site-generated candidates inside that same verified session:
+
+```bash
+curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "0.3.0",
+    "top_n": 2,
+    "include_debug": false,
+    "candidates": [
+      {
+        "candidate_id": "story-123",
+        "site_score": 0.78,
+        "candidate_topics": ["orf:media/podcasts"]
+      }
+    ]
+  }'
+```
+
+The ranking response is intentionally narrow: it returns ranked candidates, scores, and coarse reason
+codes without echoing raw profile topics or topic weights.
+
+If the site wants later reranks under the same grant to incorporate explicit outcomes, it can send
+site-local feedback events:
+
+```bash
+curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "0.3.0",
+    "events": [
+      {
+        "event_id": "feedback-1",
+        "event_type": "click",
+        "candidate_id": "story-123",
+        "candidate_topics": ["orf:media/podcasts"],
+        "occurred_at": "2025-01-21T10:00:00+00:00"
+      }
+    ]
+  }'
+```
+
+Current feedback types are intentionally narrow: `click`, `dismiss`, and `save`. These traces stay
+in the hosted service, scoped to the site grant, and are reused only for future `/rank` calls tied
+to that grant. `event_id` is the caller-generated dedupe key for safe retries. These traces are not
+written back into the portable ORF document or exposed through projection responses.
 
 Current validation rules for this flow:
 

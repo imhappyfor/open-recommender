@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from .models import ORFProfile, SignedEvent
+from .recommender import GrantSessionFeedbackRequest, GrantSessionRankRequest
 from .store import SQLiteStore
 
 
@@ -561,21 +562,31 @@ def _render_grants_page(
   <script>
     const result = document.getElementById("result");
     async function revokeGrant(grantId, csrfToken) {{
-      const response = await fetch(`/consent/grants/${{encodeURIComponent(grantId)}}/revoke`, {{
-        method: "POST",
-        headers: {{
-          "Content-Type": "application/json",
-          "X-Open-Recommender-CSRF-Token": csrfToken,
-        }},
-        body: JSON.stringify({{ actor: "browser-consent-ui", reason: "User revoked grant from grants page." }}),
-      }});
-      const body = await response.json();
-      if (!response.ok) {{
-        result.textContent = JSON.stringify(body, null, 2);
-        return;
+      const buttons = document.querySelectorAll(`button[data-grant-id='${{grantId}}']`);
+      buttons.forEach((button) => button.disabled = true);
+      result.textContent = `Revoking grant ${{grantId}}…`;
+      try {{
+        const response = await fetch(`/consent/grants/${{encodeURIComponent(grantId)}}/revoke`, {{
+          method: "POST",
+          headers: {{
+            "Content-Type": "application/json",
+            "X-Open-Recommender-CSRF-Token": csrfToken,
+          }},
+          body: JSON.stringify({{ actor: "browser-consent-ui", reason: "User revoked grant from grants page." }}),
+        }});
+        const body = await response.json().catch(() => null);
+        if (!response.ok) {{
+          result.textContent = body
+            ? JSON.stringify(body, null, 2)
+            : `Grant revoke failed with HTTP ${{response.status}}.`;
+          buttons.forEach((button) => button.disabled = false);
+          return;
+        }}
+        result.innerHTML = "<strong>Grant revoked.</strong> Refresh this page to see updated status and use /admin/audit-events to inspect the recorded audit event.";
+      }} catch (error) {{
+        result.textContent = `Grant revoke failed: ${{error instanceof Error ? error.message : String(error)}}`;
+        buttons.forEach((button) => button.disabled = false);
       }}
-      result.innerHTML = "<strong>Grant revoked.</strong> Refresh this page to see updated status and use /admin/audit-events to inspect the recorded audit event.";
-      document.querySelectorAll(`button[data-grant-id='${{grantId}}']`).forEach((button) => button.disabled = true);
     }}
     document.querySelectorAll(".revoke-button").forEach((button) => {{
       button.addEventListener("click", () => revokeGrant(button.dataset.grantId, button.dataset.csrfToken));
@@ -1717,6 +1728,52 @@ def create_app(
         return {
             "session": session.to_dict(),
             "projection": projection,
+        }
+
+    @app.post("/grant-sessions/{session_id}/rank")
+    def rank_grant_session_candidates(
+        session_id: str,
+        body: dict[str, Any],
+        request: Request,
+    ) -> dict[str, Any]:
+        enforce_rate_limit(request, "ranking-read")
+        try:
+            session = store.get_grant_session(session_id)
+            ranking_request = GrantSessionRankRequest.from_dict(
+                body,
+                default_schema_version=session.schema_version,
+            )
+            ranking = store.rank_grant_session_candidates(session, ranking_request)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "session": session.to_dict(),
+            "ranking": ranking.to_dict(include_debug=ranking_request.include_debug),
+        }
+
+    @app.post("/grant-sessions/{session_id}/rank/feedback")
+    def ingest_grant_session_feedback(
+        session_id: str,
+        body: dict[str, Any],
+        request: Request,
+    ) -> dict[str, Any]:
+        enforce_rate_limit(request, "ranking-feedback-write")
+        try:
+            session = store.get_grant_session(session_id)
+            feedback_request = GrantSessionFeedbackRequest.from_dict(
+                body,
+                default_schema_version=session.schema_version,
+            )
+            feedback = store.ingest_grant_session_feedback(session, feedback_request)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "session": session.to_dict(),
+            "feedback": feedback.to_dict(),
         }
 
     @app.get("/demo/site/{profile_id}")

@@ -4,8 +4,8 @@ This directory contains the browser-facing integration layer for Open Recommende
 
 | Package | Description |
 |---------|-------------|
-| [`orf-web-sdk/`](orf-web-sdk/README.md) | Zero-dependency ESM browser SDK — wraps the ORF service HTTP API using `fetch`. Works in React, Vite, and any modern browser. |
-| [`react-sample-app/`](react-sample-app/README.md) | Minimal Vite + React demo app that exercises the SDK end-to-end against a locally running ORF service. |
+| [`orf-web-sdk/`](orf-web-sdk/README.md) | Zero-dependency ESM browser SDK — wraps the ORF service HTTP API using `fetch`, including grant-session projection and reranking calls. Works in React, Vite, and any modern browser. |
+| [`react-sample-app/`](react-sample-app/README.md) | Minimal Vite + React demo app that exercises the SDK end-to-end against a locally running ORF service, from request creation through grant-session reranking. |
 
 ## Quick start
 

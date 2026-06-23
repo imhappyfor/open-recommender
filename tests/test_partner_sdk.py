@@ -83,6 +83,30 @@ class PartnerSDKTests(unittest.TestCase):
             ["orf:media/podcasts"],
         )
 
+        ranking = self.partner.rank_candidates(
+            verify["session"]["session_id"],
+            top_n=1,
+            candidates=[
+                {
+                    "candidate_id": "podcast-feature",
+                    "site_score": 0.7,
+                    "candidate_topics": ["orf:media/podcasts"],
+                    "metadata": {"source": "site-a"},
+                },
+                {
+                    "candidate_id": "generic-feature",
+                    "site_score": 0.8,
+                    "candidate_topics": ["orf:technology/python"],
+                    "metadata": {"source": "site-b"},
+                },
+            ],
+        )
+        ranked = ranking["ranking"]["ranked_candidates"]
+        self.assertEqual([item["candidate_id"] for item in ranked], ["podcast-feature"])
+        self.assertEqual(ranked[0]["metadata"], {"source": "site-a"})
+        self.assertNotIn("breakdown", ranked[0])
+        self.assertNotIn("topics", ranking["ranking"])
+
     def test_partner_sdk_surfaces_exchange_errors(self) -> None:
         created = self.partner.create_access_request(
             profile_id=self.profile.profile_id,
@@ -106,3 +130,42 @@ class PartnerSDKTests(unittest.TestCase):
                 requested_scopes=["profile.read"],
                 required_scopes=["profile.read"],
             )
+
+    def test_partner_sdk_records_ranking_feedback(self) -> None:
+        created = self.partner.create_access_request(
+            profile_id=self.profile.profile_id,
+            site_id="open-news-demo",
+            purpose="Personalize the pilot site feed.",
+            requested_scopes=["topics.selective:orf:media/podcasts"],
+        )
+        request_id = created["access_request"]["request_id"]
+
+        approval = self.client.post(
+            f"/site-access-requests/{request_id}/approve",
+            json={"approved_scopes": ["topics.selective:orf:media/podcasts"]},
+        )
+        self.assertEqual(approval.status_code, 200)
+
+        exchange = self.partner.exchange_access_request(request_id)
+        signature = sign_payload(exchange["challenge_payload"], self.private_key)
+        verify = self.partner.verify_access_request(
+            request_id=request_id,
+            challenge_id=exchange["challenge"]["challenge_id"],
+            signature=signature,
+        )
+        session_id = verify["session"]["session_id"]
+
+        feedback = self.partner.record_ranking_feedback(
+            session_id,
+            events=[
+                {
+                    "event_id": "feedback-1",
+                    "event_type": "click",
+                    "candidate_id": "podcast-feature",
+                    "candidate_topics": ["orf:media/podcasts"],
+                    "occurred_at": "2025-01-21T10:00:00+00:00",
+                }
+            ],
+        )
+        self.assertEqual(feedback["feedback"]["submitted_events"], 1)
+        self.assertEqual(feedback["feedback"]["accepted_events"], 1)

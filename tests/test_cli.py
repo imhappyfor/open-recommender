@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from base64 import b64encode
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -17,6 +18,12 @@ from open_recommender import cli
 from open_recommender.crypto import generate_key_pair, private_key_public_key_b64, save_private_key, sign_payload
 from open_recommender.models import EventOp, ORFProfile, build_signed_event
 from open_recommender.service import create_app
+
+
+class SeedCatalogTests(unittest.TestCase):
+    def test_seed_catalog_covers_default_seed_volume(self) -> None:
+        self.assertGreaterEqual(len(cli.SEED_TOPICS), cli.DEFAULT_SEED_TOPIC_COUNT)
+        self.assertGreaterEqual(len(cli.SEED_SITES), 1)
 
 
 class CliTests(unittest.TestCase):
@@ -243,6 +250,122 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(restore_code, 1)
         self.assertIn("does not match the profile", restore_stderr)
+
+    def test_cli_create_with_seed_populates_profile(self) -> None:
+        profile_path = Path(self.temp_dir.name) / "seeded-create.orf"
+        key_path = Path(self.temp_dir.name) / "seeded-create.orf.key"
+
+        create_code, create_stdout, create_stderr = self._run_local_cli(
+            "create",
+            str(profile_path),
+            "--display-name",
+            "Seeded User",
+            "--device-id",
+            "seed-device",
+            "--seed",
+            "--seed-value",
+            "1234",
+            "--topic-count",
+            "8",
+            "--recommendation-count",
+            "6",
+            "--days",
+            "14",
+        )
+        self.assertEqual(create_code, 0, create_stderr)
+        output = json.loads(create_stdout)
+        self.assertEqual(output["seed"]["seed_value"], 1234)
+        self.assertEqual(output["seed"]["days_simulated"], 14)
+        self.assertEqual(output["seed"]["topics_added"], 8)
+        self.assertEqual(output["seed"]["topic_update_events_added"], 14)
+        self.assertEqual(output["seed"]["recommendation_events_added"], 6)
+        self.assertTrue(profile_path.exists())
+        self.assertTrue(key_path.exists())
+
+        seeded_profile = cli.load_profile(profile_path)
+        self.assertEqual(len(seeded_profile.topics), 8)
+        self.assertEqual(len(seeded_profile.event_log), output["seed"]["total_events_added"])
+        self.assertTrue(
+            any(event.op == EventOp.RECOMMEND for event in seeded_profile.event_log)
+        )
+        self.assertEqual(seeded_profile.created_at, output["seed"]["first_event_at"])
+        first_event_at = datetime.fromisoformat(output["seed"]["first_event_at"])
+        last_event_at = datetime.fromisoformat(output["seed"]["last_event_at"])
+        self.assertGreaterEqual(last_event_at - first_event_at, timedelta(days=10))
+
+    def test_cli_create_with_seed_defaults_to_month_scale_history(self) -> None:
+        profile_path = Path(self.temp_dir.name) / "seeded-defaults.orf"
+
+        create_code, create_stdout, create_stderr = self._run_local_cli(
+            "create",
+            str(profile_path),
+            "--display-name",
+            "Seeded User",
+            "--device-id",
+            "seed-device",
+            "--seed",
+            "--seed-value",
+            "2024",
+        )
+        self.assertEqual(create_code, 0, create_stderr)
+        output = json.loads(create_stdout)
+        seed = output["seed"]
+        self.assertEqual(seed["days_simulated"], cli.DEFAULT_SEED_ACTIVITY_DAYS)
+        self.assertEqual(seed["topics_added"], cli.DEFAULT_SEED_TOPIC_COUNT)
+        self.assertEqual(
+            seed["recommendation_events_added"],
+            cli.DEFAULT_SEED_RECOMMENDATION_COUNT,
+        )
+        self.assertGreaterEqual(seed["topic_update_events_added"], cli.DEFAULT_SEED_ACTIVITY_DAYS)
+
+        seeded_profile = cli.load_profile(profile_path)
+        self.assertEqual(len(seeded_profile.event_log), seed["total_events_added"])
+        self.assertEqual(seeded_profile.created_at, seed["first_event_at"])
+        first_event_at = datetime.fromisoformat(seed["first_event_at"])
+        last_event_at = datetime.fromisoformat(seed["last_event_at"])
+        self.assertGreaterEqual(last_event_at - first_event_at, timedelta(days=25))
+
+    def test_cli_seed_command_populates_existing_profile(self) -> None:
+        profile_path = Path(self.temp_dir.name) / "existing.orf"
+        key_path = Path(self.temp_dir.name) / "existing.orf.key"
+        empty_private_key, empty_public_key = generate_key_pair()
+        empty_profile = ORFProfile.create("Existing User", empty_public_key, "seed-device")
+        cli.save_profile(profile_path, empty_profile)
+        save_private_key(key_path, empty_private_key)
+
+        seed_code, seed_stdout, seed_stderr = self._run_local_cli(
+            "seed",
+            str(profile_path),
+            "--seed-value",
+            "77",
+            "--topic-count",
+            "10",
+            "--recommendation-count",
+            "4",
+            "--days",
+            "21",
+        )
+        self.assertEqual(seed_code, 0, seed_stderr)
+        output = json.loads(seed_stdout)
+        self.assertEqual(output["seed"]["seed_value"], 77)
+        self.assertEqual(output["seed"]["days_simulated"], 21)
+        self.assertEqual(output["seed"]["topics_added"], 10)
+        self.assertEqual(output["seed"]["recommendation_events_added"], 4)
+
+        seeded_profile = cli.load_profile(profile_path)
+        self.assertEqual(len(seeded_profile.topics), 10)
+        self.assertGreaterEqual(len(seeded_profile.opt_out_topics), 1)
+
+        feed_code, feed_stdout, feed_stderr = self._run_local_cli(
+            "feed",
+            "show",
+            str(profile_path),
+            "--top-n",
+            "5",
+        )
+        self.assertEqual(feed_code, 0, feed_stderr)
+        feed_output = json.loads(feed_stdout)
+        self.assertGreater(feed_output["feed_size"], 0)
 
     def test_cli_feed_show_aggregates_recommendations(self) -> None:
         """Feed show command displays aggregated recommendations from profile."""

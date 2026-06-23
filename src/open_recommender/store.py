@@ -19,13 +19,23 @@ from .models import (
     SignedEvent,
     SiteAccessRequest,
     SyncState,
+    ensure_supported_schema_version,
     normalize_request_scope_sets,
     normalize_scope_set,
     utc_now,
 )
+from .recommender import (
+    GrantFeedbackSignals,
+    GrantSessionFeedbackIngestResult,
+    GrantSessionFeedbackRequest,
+    GrantSessionRankRequest,
+    GrantSessionRankingResult,
+    GrantSessionRanker,
+    RankingFeedbackEvent,
+)
 
 
-STORE_SCHEMA_VERSION = 3
+STORE_SCHEMA_VERSION = 4
 CHALLENGE_TTL_SECONDS = 300
 DEFAULT_GRANT_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_GRANT_SESSION_TTL_SECONDS = 30 * 60
@@ -78,6 +88,9 @@ class SQLiteStore:
             if version < 3:
                 self._migrate_v3(connection)
                 version = 3
+            if version < 4:
+                self._migrate_v4(connection)
+                version = 4
             self._set_schema_version(connection, version)
             self._seed_pilot_sites(connection)
 
@@ -198,6 +211,31 @@ class SQLiteStore:
             """
         )
         self._set_schema_version(connection, 3)
+
+    def _migrate_v4(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS ranking_feedback_events (
+                event_id TEXT PRIMARY KEY,
+                grant_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                site_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_grant_time
+            ON ranking_feedback_events (grant_id, occurred_at, event_id);
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_session_time
+            ON ranking_feedback_events (session_id, occurred_at, event_id);
+            """
+        )
+        self._set_schema_version(connection, 4)
 
     def _table_columns(self, connection: sqlite3.Connection, table_name: str) -> set[str]:
         return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table_name})")}
@@ -1012,6 +1050,131 @@ class SQLiteStore:
                 payload={"approved_scopes": list(session.approved_scopes)},
             )
         return projection
+
+    def rank_grant_session_candidates(
+        self,
+        session: GrantSession,
+        ranking_request: GrantSessionRankRequest,
+    ) -> GrantSessionRankingResult:
+        ensure_supported_schema_version(
+            ranking_request.schema_version,
+            current_version=session.schema_version,
+        )
+        profile = self.get_profile(session.profile_id)
+        if profile is None:
+            raise KeyError("Profile not found.")
+
+        projection = profile.consented_projection(
+            session.approved_scopes,
+            site_id=session.site_id,
+            grant_id=session.grant_id,
+            schema_version=ranking_request.schema_version,
+        )
+        granted_topic_weights = {
+            str(topic["topic"]): float(topic["weight"])
+            for topic in projection.get("topics", [])
+        }
+        feedback_events = self._list_grant_feedback_events(session.grant_id)
+        feedback_signals = GrantFeedbackSignals.from_events(feedback_events)
+        ranking = GrantSessionRanker(
+            granted_topic_weights,
+            feedback_signals=feedback_signals,
+        ).rank(
+            ranking_request,
+            site_id=session.site_id,
+            grant_id=session.grant_id,
+        )
+        with self._connect() as connection:
+            self._write_audit_event(
+                connection,
+                "ranking.read",
+                profile_id=session.profile_id,
+                site_id=session.site_id,
+                grant_id=session.grant_id,
+                session_id=session.session_id,
+                payload={
+                    "approved_scopes": list(session.approved_scopes),
+                    "candidate_count": len(ranking_request.candidates),
+                    "top_n": ranking.top_n,
+                    "feedback_events_considered": len(feedback_events),
+                },
+            )
+        return ranking
+
+    def ingest_grant_session_feedback(
+        self,
+        session: GrantSession,
+        feedback_request: GrantSessionFeedbackRequest,
+    ) -> GrantSessionFeedbackIngestResult:
+        ensure_supported_schema_version(
+            feedback_request.schema_version,
+            current_version=session.schema_version,
+        )
+        ingested_at = utc_now()
+        accepted_events = 0
+        accepted_feedback_types: set[str] = set()
+        with self._connect() as connection:
+            for event in feedback_request.events:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO ranking_feedback_events (
+                        event_id, grant_id, session_id, profile_id, site_id, candidate_id,
+                        event_type, event_json, occurred_at, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        session.grant_id,
+                        session.session_id,
+                        session.profile_id,
+                        session.site_id,
+                        event.candidate_id,
+                        event.event_type.value,
+                        json.dumps(event.to_dict(), sort_keys=True),
+                        event.occurred_at,
+                        ingested_at,
+                    ),
+                )
+                if cursor.rowcount:
+                    accepted_events += 1
+                    accepted_feedback_types.add(event.event_type.value)
+
+            self._write_audit_event(
+                connection,
+                "ranking-feedback.ingested",
+                profile_id=session.profile_id,
+                site_id=session.site_id,
+                grant_id=session.grant_id,
+                session_id=session.session_id,
+                payload={
+                    "submitted_events": len(feedback_request.events),
+                    "accepted_events": accepted_events,
+                    "feedback_types": sorted(accepted_feedback_types),
+                },
+            )
+        return GrantSessionFeedbackIngestResult(
+            schema_version=feedback_request.schema_version,
+            submitted_events=len(feedback_request.events),
+            accepted_events=accepted_events,
+            ingested_at=ingested_at,
+        )
+
+    def _list_grant_feedback_events(self, grant_id: str) -> tuple[RankingFeedbackEvent, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_json
+                FROM ranking_feedback_events
+                WHERE grant_id = ?
+                ORDER BY occurred_at ASC, created_at ASC, event_id ASC
+                """,
+                (grant_id,),
+            ).fetchall()
+        return tuple(
+            RankingFeedbackEvent.from_dict(json.loads(row["event_json"]))
+            for row in rows
+        )
 
     def _verified_profile(self, profile: ORFProfile) -> ORFProfile:
         if not profile.event_log:

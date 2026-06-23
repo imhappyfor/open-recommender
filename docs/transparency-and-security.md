@@ -14,14 +14,19 @@ If you enable hosted sync (by setting `OPEN_RECOMMENDER_SYNC_TOKEN`), the servic
 
 - **Your signed profile events** — the cryptographic record of your preference updates (topic set/remove, consent changes).
 - **Event metadata** — timestamp, logical clock, signature verification status.
-- **Your public projections** — the consent-gated view of your data that you explicitly approved.
 - **A signed challenge** — a temporary cryptographic proof that you control your Ed25519 key, used only during the challenge-response flow.
+
+### Grant-Session Ranking Feedback
+
+If a site uses `POST /grant-sessions/{session_id}/rank/feedback`, the service stores:
+
+- **Explicit ranking feedback events (optional)** — narrow site-local outcomes such as `click`, `dismiss`, or `save`, stored per grant to improve later reranking for that same site grant.
 
 ### What We Do NOT Store
 
-- **Your private or selective topics** — only the topics you marked `public` are ever stored or processed.
-- **Your opted-out topics** — if you remove a topic, that removal is an event (for conflict resolution), but the topic preference itself is not stored.
-- **Your browsing history, clicks, or behavioral traces** — we only store preference state, not the path you took to get there.
+- **A public or consented projection copy of your private topics** — private topics stay out of projections, and selective topics appear only when a grant explicitly covers them.
+- **Your opted-out topics as active preferences** — if you remove a topic, that removal is kept only as a signed event for conflict resolution, not as an active topic weight.
+- **Your general browsing history or cross-site behavior graph** — the service does not crawl, infer, or publish your behavior. If a site explicitly submits a ranking feedback event, that event stays local to the hosted service and grant; it does not become portable ORF profile data.
 - **Your Ed25519 private key** — it lives only on your device. We never see it.
 - **Any personally identifiable information** beyond what you explicitly put in your profile (display name, device ID).
 
@@ -47,7 +52,8 @@ If you enable hosted sync (by setting `OPEN_RECOMMENDER_SYNC_TOKEN`), the servic
 1. **Event ingestion** (`POST /profiles/{id}/events`) — accepts signed events, validates signatures, stores append-only events.
 2. **Event retrieval** (`GET /profiles/{id}/events`) — returns your signed events (requires valid sync token if token-gating is enabled).
 3. **Projection** (`GET /grant-sessions/{session_id}/projection`) — builds a view of your public preferences based on consent settings; does not store this view, only computes it on-demand.
-4. **Health check** (`GET /health`) — reports service status; no profile data involved.
+4. **Ranking feedback ingestion** (`POST /grant-sessions/{session_id}/rank/feedback`) — stores narrow site-local outcome events for later reranks under the same grant; does not mutate the ORF profile or projection contract.
+5. **Health check** (`GET /health`) — reports service status; no profile data involved.
 
 **What it doesn't do:**
 - Infer hidden preferences from your data
@@ -55,6 +61,7 @@ If you enable hosted sync (by setting `OPEN_RECOMMENDER_SYNC_TOKEN`), the servic
 - Store requests that failed signature verification
 - Log your full profile to stdout or a file
 - Analyze patterns across users
+- Turn site-local ranking feedback into public profile fields or consented projection fields
 
 ---
 
@@ -157,6 +164,7 @@ Compare the service's events to your local `.orf` file. They should be identical
 
 All source code is on GitHub. The files you should audit:
 - `src/open_recommender/models.py` — profile schema and visibility rules
+- `src/open_recommender/recommender/feed.py` — local feed aggregation and ranking logic
 - `src/open_recommender/service.py` — API endpoints and what they process
 - `src/open_recommender/store.py` — database schema and query logic
 - `tests/test_service.py` — test cases showing what the API accepts and rejects

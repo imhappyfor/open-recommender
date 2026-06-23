@@ -46,6 +46,7 @@ The local ORF service must be running, and it already allows browser requests fr
 5. **Start exchange** — once approved, click to call `client.startExchange(…)`. The challenge ID is displayed.
 6. **Finish sign-in in the browser** — upload the matching unencrypted PKCS#8 PEM `.orf.key` file. The demo imports it with Web Crypto, signs `challenge_payload` in-tab, and sends only the signature to `client.verifySignature(…)`.
 7. **Projection** — after a successful `client.verifySignature(…)` + `client.getProjection(…)` call, the consented projection is rendered in the same browser flow.
+8. **Rerank the sample feed** — the demo immediately calls `client.rankCandidates(…)` with a fixed set of site-owned candidates so the flow continues into a realistic recommendation handoff instead of stopping at projection.
 
 ## Local key boundary
 
@@ -68,8 +69,9 @@ npm test
 ```
 
 This runs a Puppeteer smoke test against a local mock ORF API and the built React app. It covers
-browser-side profile import, request creation, inline consent approval, exchange start, and the
-projection handoff. The mock API still treats signature verification as a stubbed success path.
+browser-side profile import, request creation, inline consent approval, exchange start, projection
+handoff, and grant-session reranking of the sample feed. The mock API still treats signature
+verification as a stubbed success path.
 
 ## SDK note
 
