@@ -9,15 +9,18 @@ from pathlib import Path
 import time
 from typing import Any
 from dataclasses import dataclass
+from threading import Lock
 
 from cryptography.exceptions import InvalidSignature
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .crypto import load_json
 from .models import ORFProfile, SignedEvent
 from .recommender import GrantSessionFeedbackRequest, GrantSessionRankRequest
-from .store import SQLiteStore
+from .store import ResourceLimitExceeded, SQLiteStore
 
 
 @dataclass(frozen=True)
@@ -28,21 +31,103 @@ class ServiceConfig:
     rate_limit_max_requests: int
     pilot_sites_path: str | None
     sync_token: str | None
+    site_token_hashes: dict[str, str] | None
+    max_request_bytes: int
+    max_profile_events: int
+    max_ranking_candidates: int
+    max_feedback_batch: int
+    max_grant_feedback_events: int
+    max_history_bytes: int
+
+
+class RequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        json_body = True  # FastAPI treats absent Content-Type as JSON too.
+        for name, value in scope["headers"]:
+            if name.lower() == b"content-type":
+                media_type = value.split(b";", 1)[0].strip().lower()
+                json_body = media_type == b"application/json" or media_type.endswith(b"+json")
+            if name.lower() == b"content-length":
+                try:
+                    declared_size = int(value)
+                    if declared_size < 0:
+                        raise ValueError
+                except ValueError:
+                    await JSONResponse({"detail": "Invalid Content-Length."}, status_code=400)(scope, receive, send)
+                    return
+                if declared_size > self.max_bytes:
+                    await JSONResponse({"detail": f"Request body exceeds {self.max_bytes} bytes."},
+                        status_code=413)(scope, receive, send)
+                    return
+        # FastAPI buffers JSON anyway; bound those bytes before its parser sees them.
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > self.max_bytes:
+                await JSONResponse({"detail": f"Request body exceeds {self.max_bytes} bytes."},
+                    status_code=413)(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        if body and json_body:
+            # ponytail: one bounded validation pass before FastAPI parsing; cache the decoder if measured parsing cost matters.
+            try:
+                load_json(body)
+            except ValueError:
+                await JSONResponse({"detail": "Request body must be UTF-8 JSON with unique object fields and finite constants."},
+                    status_code=400)(scope, receive, send)
+                return
+
+        delivered = False
+
+        async def bounded_receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        await self.app(scope, bounded_receive, send)
 
 
 class FixedWindowRateLimiter:
-    def __init__(self, *, window_seconds: int, max_requests: int) -> None:
-        if window_seconds <= 0:
-            raise ValueError("Rate limit window must be positive.")
-        if max_requests <= 0:
-            raise ValueError("Rate limit max requests must be positive.")
+    def __init__(self, *, window_seconds: int, max_requests: int, max_buckets: int = 10_000) -> None:
+        for name, value in (("window", window_seconds), ("max requests", max_requests), ("max buckets", max_buckets)):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"Rate limit {name} must be a positive integer.")
         self.window_seconds = window_seconds
         self.max_requests = max_requests
+        self.max_buckets = max_buckets
         self._buckets: dict[str, tuple[float, int]] = {}
+        # ponytail: process-local lock/state; use a shared limiter before running multiple workers.
+        self._lock = Lock()
+        self._next_cleanup = 0.0
 
     def check(self, bucket: str, client_id: str) -> None:
+        with self._lock:
+            self._check(bucket, client_id)
+
+    def _check(self, bucket: str, client_id: str) -> None:
         key = f"{bucket}:{client_id}"
         now = time.monotonic()
+        if now >= self._next_cleanup:
+            self._buckets = {key: value for key, value in self._buckets.items() if value[0] > now}
+            self._next_cleanup = now + self.window_seconds
+        if key not in self._buckets and len(self._buckets) >= self.max_buckets:
+            raise HTTPException(status_code=429, detail="Rate limiter capacity reached; retry after a window expires.",
+                headers={"Retry-After": str(self.window_seconds)})
         reset_at, count = self._buckets.get(key, (now + self.window_seconds, 0))
         if now >= reset_at:
             reset_at = now + self.window_seconds
@@ -56,6 +141,7 @@ class FixedWindowRateLimiter:
                     "bucket": bucket,
                     "retry_after_seconds": retry_after_seconds,
                 },
+                headers={"Retry-After": str(retry_after_seconds)},
             )
         self._buckets[key] = (reset_at, count + 1)
 
@@ -78,6 +164,13 @@ def _service_config(
     rate_limit_max_requests: int | None,
     pilot_sites_path: str | Path | None,
     sync_token: str | None,
+    site_token_hashes: dict[str, str] | None,
+    max_request_bytes: int | None,
+    max_profile_events: int | None,
+    max_ranking_candidates: int | None,
+    max_feedback_batch: int | None,
+    max_grant_feedback_events: int | None,
+    max_history_bytes: int | None,
 ) -> ServiceConfig:
     resolved_db_path = str(db_path or os.getenv("OPEN_RECOMMENDER_DB_PATH", "open_recommender.db"))
     resolved_admin_token = admin_token if admin_token is not None else os.getenv("OPEN_RECOMMENDER_ADMIN_TOKEN")
@@ -97,6 +190,35 @@ def _service_config(
         else os.getenv("OPEN_RECOMMENDER_PILOT_SITES_PATH")
     )
     resolved_sync_token = sync_token if sync_token is not None else os.getenv("OPEN_RECOMMENDER_SYNC_TOKEN")
+    if site_token_hashes is None:
+        raw_hashes = os.getenv("OPEN_RECOMMENDER_SITE_TOKEN_HASHES")
+        site_token_hashes = load_json(raw_hashes) if raw_hashes is not None else None
+        if raw_hashes is not None and not isinstance(site_token_hashes, dict):
+            raise ValueError("OPEN_RECOMMENDER_SITE_TOKEN_HASHES must be a JSON object.")
+    if site_token_hashes is not None:
+        if not isinstance(site_token_hashes, dict) or any(
+            not isinstance(site_id, str) or not site_id.strip()
+            or not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for site_id, digest in site_token_hashes.items()
+        ):
+            raise ValueError("Site token hashes must map nonblank site IDs to lowercase SHA-256 hex digests.")
+        if len(set(site_token_hashes.values())) != len(site_token_hashes):
+            raise ValueError("Each site must have a distinct token hash.")
+        site_token_hashes = dict(site_token_hashes)
+    limits = {}
+    for name, provided, default in (
+        ("max_request_bytes", max_request_bytes, 2 * 1024 * 1024),
+        ("max_profile_events", max_profile_events, 10_000),
+        ("max_ranking_candidates", max_ranking_candidates, 500),
+        ("max_feedback_batch", max_feedback_batch, 500),
+        ("max_grant_feedback_events", max_grant_feedback_events, 10_000),
+        ("max_history_bytes", max_history_bytes, 8 * 1024 * 1024),
+    ):
+        value = provided if provided is not None else _int_env(f"OPEN_RECOMMENDER_{name.upper()}", default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
+        limits[name] = value
     return ServiceConfig(
         db_path=resolved_db_path,
         admin_token=resolved_admin_token,
@@ -104,11 +226,13 @@ def _service_config(
         rate_limit_max_requests=resolved_max_requests,
         pilot_sites_path=resolved_pilot_sites_path,
         sync_token=resolved_sync_token,
+        site_token_hashes=site_token_hashes,
+        **limits,
     )
 
 
 def _pilot_sites_from_path(path: str | Path) -> tuple[dict[str, Any], ...]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = load_json(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError("Pilot sites config must be a JSON array.")
     sites: list[dict[str, Any]] = []
@@ -123,6 +247,12 @@ def _pilot_sites_from_path(path: str | Path) -> tuple[dict[str, Any], ...]:
             )
         sites.append(dict(item))
     return tuple(sites)
+
+
+def require_local_browser(request: Request) -> None:
+    client_id = request.client.host if request.client is not None else "unknown"
+    if client_id not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(status_code=403, detail="Local browser surfaces are only available from localhost.")
 
 
 def _humanize_topic(topic: str) -> str:
@@ -476,6 +606,37 @@ def _render_consent_index_page(
 </html>"""
 
 
+def _render_owner_signer() -> str:
+    return r'''<div class="card">
+      <label for="owner-key"><strong>Choose this profile's signing key</strong></label>
+      <input id="owner-key" type="file" accept=".key,.pem">
+      <p class="muted">Use the matching unencrypted .orf.key to approve, deny, or revoke access.
+      The key stays in this browser tab; only its signature is sent. For encrypted keys, use the CLI.</p>
+    </div>
+    <script>
+      async function signOwnerAction(profileId, action, targetId, parameters) {
+        const file = document.getElementById("owner-key").files[0];
+        if (!file) throw new Error("Choose the matching .orf.key file first.");
+        const pem = await file.text();
+        const match = pem.match(/-----BEGIN PRIVATE KEY-----([\s\S]+?)-----END PRIVATE KEY-----/);
+        if (!match) throw new Error("Use an unencrypted PKCS#8 key, or use the CLI with an encrypted key.");
+        const bytes = Uint8Array.from(atob(match[1].replace(/\s+/g, "")), ch => ch.charCodeAt(0));
+        const key = await crypto.subtle.importKey("pkcs8", bytes, {name: "Ed25519"}, false, ["sign"]);
+        const response = await fetch(`/profiles/${encodeURIComponent(profileId)}/owner-action-challenges`, {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action, target_id: targetId, parameters})
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || "Could not create owner challenge.");
+        const challenge = body.challenge_payload;
+        const payload = new TextEncoder().encode(JSON.stringify(challenge, Object.keys(challenge).sort()));
+        const signature = new Uint8Array(await crypto.subtle.sign("Ed25519", key, payload));
+        return {challenge_id: challenge.challenge_id,
+          signature: btoa(String.fromCharCode(...signature)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")};
+      }
+    </script>'''
+
+
 def _render_grants_page(
     *,
     grants: list[dict[str, Any]],
@@ -496,7 +657,8 @@ def _render_grants_page(
             if status == "active":
                 revoke_button = (
                     f"<button class='revoke-button' data-grant-id='{escape(grant_id)}' "
-                    f"data-csrf-token='{escape(csrf_tokens[grant_id])}'>Revoke grant</button>"
+                    f"data-csrf-token='{escape(csrf_tokens[grant_id])}' "
+                    f"data-profile-id='{escape(str(item['profile_id']))}'>Revoke grant</button>"
                 )
             rows.append(
                 "<div class='grant-row'>"
@@ -550,7 +712,8 @@ def _render_grants_page(
   <main>
     {_render_trust_nav(active='grants')}
     <h1>Site Grants</h1>
-    <p class="lead">This localhost-only page shows approved grants and lets you revoke active grants to stop future session exchanges.</p>
+    {_render_owner_signer()}
+    <p class="lead">This localhost-only page shows approved grants and lets you revoke active grants to block new exchanges and further use of existing sessions.</p>
     {filter_hint}
     <div class="card">
       <h2>Revocation behavior</h2>
@@ -561,18 +724,20 @@ def _render_grants_page(
   </main>
   <script>
     const result = document.getElementById("result");
-    async function revokeGrant(grantId, csrfToken) {{
+    async function revokeGrant(grantId, csrfToken, profileId) {{
       const buttons = document.querySelectorAll(`button[data-grant-id='${{grantId}}']`);
       buttons.forEach((button) => button.disabled = true);
       result.textContent = `Revoking grant ${{grantId}}…`;
       try {{
+        const parameters = {{actor: "browser-consent-ui", reason: "User revoked grant from grants page."}};
+        const ownerProof = await signOwnerAction(profileId, "revoke", grantId, parameters);
         const response = await fetch(`/consent/grants/${{encodeURIComponent(grantId)}}/revoke`, {{
           method: "POST",
           headers: {{
             "Content-Type": "application/json",
             "X-Open-Recommender-CSRF-Token": csrfToken,
           }},
-          body: JSON.stringify({{ actor: "browser-consent-ui", reason: "User revoked grant from grants page." }}),
+          body: JSON.stringify({{...parameters, owner_proof: ownerProof}}),
         }});
         const body = await response.json().catch(() => null);
         if (!response.ok) {{
@@ -589,7 +754,7 @@ def _render_grants_page(
       }}
     }}
     document.querySelectorAll(".revoke-button").forEach((button) => {{
-      button.addEventListener("click", () => revokeGrant(button.dataset.grantId, button.dataset.csrfToken));
+      button.addEventListener("click", () => revokeGrant(button.dataset.grantId, button.dataset.csrfToken, button.dataset.profileId));
     }});
   </script>
 </body>
@@ -682,6 +847,7 @@ def _render_consent_review_page(
   <main>
     {_render_trust_nav(active='consent')}
     <h1>Review site access request</h1>
+    {_render_owner_signer()}
     <p class="lead">This localhost-only review page shows what <strong>{escape(str(access_request.get('site_name', 'This site')))}</strong> is asking for and what it could see if you approve it.</p>
     <div class="grid">
       <div class="card">
@@ -695,7 +861,7 @@ def _render_consent_review_page(
       </div>
       <div class="card">
         <h2>How to read this page</h2>
-        <p class="muted">Required scopes are all-or-nothing for this request. Optional scopes are the parts you can keep or remove. Private topics stay on this device either way.</p>
+        <p class="muted">Required scopes are all-or-nothing for this request. Optional scopes are the parts you can keep or remove. Private topics are excluded from the site's projection; the sync service can read uploaded topics.</p>
       </div>
     </div>
     {ignored_html}
@@ -714,13 +880,15 @@ def _render_consent_review_page(
       return Array.from(document.querySelectorAll("input[name='approved-scope']:checked")).map((input) => input.value);
     }}
     async function sendDecision(url, payload) {{
+      const action = url.endsWith("/approve") ? "approve" : "deny";
+      const ownerProof = await signOwnerAction(profileId, action, {json.dumps(request_id)}, payload);
       const response = await fetch(url, {{
         method: "POST",
         headers: {{
           "Content-Type": "application/json",
           "X-Open-Recommender-CSRF-Token": csrfToken
         }},
-        body: JSON.stringify(payload)
+        body: JSON.stringify({{...payload, owner_proof: ownerProof}})
       }});
       const body = await response.json();
       if (response.ok) {{
@@ -743,13 +911,13 @@ def _render_consent_review_page(
       sendDecision(approveUrl, {{
         approved_scopes: selectedScopes(),
         actor: "browser-consent-ui"
-      }});
+      }}).catch(error => result.textContent = error.message);
     }}
     function denyRequest() {{
       sendDecision(denyUrl, {{
         reason: document.getElementById("deny-reason")?.value || null,
         actor: "browser-consent-ui"
-      }});
+      }}).catch(error => result.textContent = error.message);
     }}
   </script>
 </body>
@@ -816,9 +984,9 @@ def _render_profile_lens_page() -> str:
       </section>
       <section class="card">
         <h2>How to read this</h2>
-        <p class="muted">This page answers three questions: what stays on this device, what is already public, and what a site could see if you approved specific scopes.</p>
+        <p class="muted">This page shows what stays out of partner projections, what is already public, and what a site could see if you approved specific scopes. Registering or syncing uploads full history, including private topics, to the service.</p>
         <ul class="muted">
-          <li><strong>Private</strong> topics stay on this device.</li>
+          <li><strong>Private</strong> topics stay out of partner projections; uploaded profiles remain readable by the sync service.</li>
           <li><strong>Public</strong> topics can appear in the public view when public-topic sharing is enabled.</li>
           <li><strong>Selective</strong> topics only appear in the site view if you choose them.</li>
         </ul>
@@ -839,7 +1007,7 @@ def _render_profile_lens_page() -> str:
       </div>
       <div class="grid" style="margin-top: 16px;">
         <section class="card">
-          <h2>What stays on this device</h2>
+          <h2>What stays out of partner projections</h2>
           <div id="private-topics"></div>
         </section>
         <section class="card">
@@ -1035,7 +1203,7 @@ def _render_profile_lens_page() -> str:
         consent: profile.consent
       }, null, 2);
 
-      renderTopicList("private-topics", privateTopics, () => "Only stays local. Never shared through public or site-scoped preview.");
+      renderTopicList("private-topics", privateTopics, () => "Excluded from public and site-scoped projections. Readable by the service if uploaded.");
       renderTopicList("public-topics", publicTopics, () => profile.consent.share_public_topics
         ? "Already public because public-topic sharing is enabled."
         : "Hidden because public-topic sharing is disabled.");
@@ -1118,7 +1286,7 @@ def _render_profile_lens_page() -> str:
       }
       const text = await file.text();
       const profile = JSON.parse(text);
-      state.localProfileDocument = profile;
+      state.localProfileDocument = text;
       renderProfile(profile, `Loaded local file: ${file.name}`, { localPreview: true });
     });
 
@@ -1134,7 +1302,7 @@ def _render_profile_lens_page() -> str:
         const response = await fetch("/lens/profiles/import", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ profile: state.localProfileDocument })
+          body: `{"profile":${state.localProfileDocument}}`
         });
         const body = await response.json();
         if (!response.ok) {
@@ -1167,6 +1335,13 @@ def create_app(
     pilot_sites_path: str | Path | None = None,
     pilot_sites: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     sync_token: str | None = None,
+    site_token_hashes: dict[str, str] | None = None,
+    max_request_bytes: int | None = None,
+    max_profile_events: int | None = None,
+    max_ranking_candidates: int | None = None,
+    max_feedback_batch: int | None = None,
+    max_grant_feedback_events: int | None = None,
+    max_history_bytes: int | None = None,
 ) -> FastAPI:
     config = _service_config(
         db_path,
@@ -1175,6 +1350,13 @@ def create_app(
         rate_limit_max_requests=rate_limit_max_requests,
         pilot_sites_path=pilot_sites_path,
         sync_token=sync_token,
+        site_token_hashes=site_token_hashes,
+        max_request_bytes=max_request_bytes,
+        max_profile_events=max_profile_events,
+        max_ranking_candidates=max_ranking_candidates,
+        max_feedback_batch=max_feedback_batch,
+        max_grant_feedback_events=max_grant_feedback_events,
+        max_history_bytes=max_history_bytes,
     )
     if pilot_sites is not None and config.pilot_sites_path is not None:
         raise ValueError("Configure pilot sites with either pilot_sites or pilot_sites_path, not both.")
@@ -1190,6 +1372,7 @@ def create_app(
         version="0.1.0",
         description="Hosted sync and public profile API for portable ORF profiles.",
     )
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=config.max_request_bytes)
     app.add_middleware(
         CORSMiddleware,
         allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
@@ -1197,7 +1380,9 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    store = SQLiteStore(config.db_path, pilot_sites=resolved_pilot_sites)
+    store = SQLiteStore(config.db_path, pilot_sites=resolved_pilot_sites,
+        max_profile_events=config.max_profile_events, max_grant_feedback_events=config.max_grant_feedback_events,
+        max_history_bytes=config.max_history_bytes)
     rate_limiter = FixedWindowRateLimiter(
         window_seconds=config.rate_limit_window_seconds,
         max_requests=config.rate_limit_max_requests,
@@ -1205,15 +1390,44 @@ def create_app(
     browser_secret = store.browser_secret()
     app.state.store = store
     app.state.config = config
+    if config.site_token_hashes is not None:
+        registered_ids = {site["site_id"] for site in store.list_pilot_sites()}
+        if not config.site_token_hashes.keys() <= registered_ids:
+            raise ValueError("Site token hashes contain an unregistered site ID.")
+
+    @app.exception_handler(ResourceLimitExceeded)
+    async def resource_limit_error(request: Request, error: ResourceLimitExceeded):
+        return JSONResponse({"detail": str(error)}, status_code=413)
+
+    @app.middleware("http")
+    async def prevent_private_response_caching(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if not (request.method == "GET" and path.startswith("/profiles/") and path.endswith("/public")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     def enforce_rate_limit(request: Request, bucket: str) -> None:
         client_id = request.client.host if request.client is not None else "unknown"
         rate_limiter.check(bucket, client_id)
 
-    def require_local_browser(request: Request) -> None:
-        client_id = request.client.host if request.client is not None else "unknown"
-        if client_id not in {"127.0.0.1", "::1", "localhost", "testclient"}:
-            raise HTTPException(status_code=403, detail="Local browser surfaces are only available from localhost.")
+    def enforce_item_limit(items: Any, limit: int, label: str) -> None:
+        if isinstance(items, list) and len(items) > limit:
+            raise ResourceLimitExceeded(f"{label} exceeds the configured limit of {limit}.")
+
+    def require_partner(request: Request) -> str | None:
+        if config.site_token_hashes is None:
+            return None  # Local preview compatibility, not authenticated site identity.
+        enforce_rate_limit(request, "partner-auth")
+        site_ids = request.headers.getlist("x-orf-site-id")
+        tokens = request.headers.getlist("x-orf-site-token")
+        expected = config.site_token_hashes.get(site_ids[0]) if len(site_ids) == 1 else None
+        if expected is None or len(tokens) != 1 or not hmac.compare_digest(
+            hashlib.sha256(tokens[0].encode("utf-8")).hexdigest(), expected
+        ):
+            raise HTTPException(status_code=401, detail="Valid site credentials are required.")
+        # ponytail: static hashes; restart all workers to rotate, use a credential store for live rotation.
+        return site_ids[0]
 
     def require_admin_token(header_value: str | None) -> None:
         if config.admin_token is None:
@@ -1243,6 +1457,18 @@ def create_app(
         if token is None or not hmac.compare_digest(expected, token):
             raise HTTPException(status_code=403, detail="Consent review token is invalid.")
 
+    def perform_owner_action(action: str, target_id: str, body: dict[str, Any]) -> Any:
+        parameters = dict(body)
+        proof = parameters.pop("owner_proof", None)
+        if not isinstance(proof, dict) or not all(
+            isinstance(proof.get(field), str) and proof[field] for field in ("challenge_id", "signature")
+        ):
+            raise HTTPException(status_code=401, detail="A signed owner_proof is required.")
+        try:
+            return store.perform_owner_action(action, target_id, parameters, proof)
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {
@@ -1255,12 +1481,23 @@ def create_app(
                 "pilot_sites_count": len(store.list_pilot_sites()),
                 "pilot_sites_path": config.pilot_sites_path,
                 "sync_auth_required": config.sync_token is not None,
+                "sync_token_required": config.sync_token is not None,
+                "sync_read_owner_proof_required": True,
+                "site_auth_required": config.site_token_hashes is not None,
+                "limits": {name: getattr(config, name) for name in (
+                    "max_request_bytes", "max_profile_events", "max_ranking_candidates",
+                    "max_feedback_batch", "max_grant_feedback_events", "max_history_bytes",
+                )},
             },
         }
 
     @app.post("/profiles")
-    def upsert_profile(body: dict[str, Any]) -> dict[str, Any]:
+    def upsert_profile(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        enforce_rate_limit(request, "profile-write")
         try:
+            raw_profile = body["profile"]
+            if isinstance(raw_profile, dict):
+                enforce_item_limit(raw_profile.get("event_log"), config.max_profile_events, "Profile event count")
             profile = ORFProfile.from_document(body["profile"])
             saved = store.save_profile(profile)
         except (KeyError, TypeError, ValueError, InvalidSignature) as error:
@@ -1277,30 +1514,45 @@ def create_app(
             raise HTTPException(status_code=404, detail="Profile not found.")
         return profile.public_projection()
 
-    @app.get("/profiles/{profile_id}/events")
+    @app.get("/profiles/{profile_id}/events", deprecated=True)
     def get_events(
         profile_id: str,
         after_clock: int = Query(default=0, ge=0),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_sync_token(authorization)
-        profile = store.get_profile(profile_id)
-        if profile is None:
-            raise HTTPException(status_code=404, detail="Profile not found.")
-        return {
-            "profile_id": profile_id,
-            "events": store.list_events(profile_id, after_clock=after_clock),
-        }
+        raise HTTPException(status_code=410,
+            detail="Raw event reads require an owner proof. Use POST /profiles/{profile_id}/events/read.")
+
+    @app.post("/profiles/{profile_id}/events/read")
+    def read_owner_events(
+        profile_id: str, body: dict[str, Any], request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        enforce_rate_limit(request, "sync-read")
+        require_sync_token(authorization)
+        try:
+            return perform_owner_action("sync-read", profile_id, body)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/profiles/{profile_id}/events")
     def post_events(
         profile_id: str,
         body: dict[str, Any],
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_sync_token(authorization)
+        enforce_rate_limit(request, "profile-write")
         try:
-            events = [SignedEvent.from_dict(item) for item in body.get("events", [])]
+            raw_events = body.get("events")
+            enforce_item_limit(raw_events, config.max_profile_events, "Event batch count")
+            if not isinstance(raw_events, list):
+                raise ValueError("Events must be an array.")
+            events = [SignedEvent.from_dict(item) for item in raw_events]
             profile = store.append_events(profile_id, events)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1322,6 +1574,29 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         return challenge
 
+    @app.post("/profiles/{profile_id}/owner-action-challenges")
+    def create_owner_action_challenge(profile_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+        enforce_rate_limit(request, "owner-action-challenge")
+        try:
+            challenge = store.create_owner_action_challenge(
+                profile_id, str(body["action"]), str(body["target_id"]), body.get("parameters", {})
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"challenge_payload": challenge}
+
+    @app.post("/profiles/{profile_id}/delete")
+    def delete_profile(profile_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+        enforce_rate_limit(request, "profile-delete")
+        try:
+            return perform_owner_action("delete", profile_id, body)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.post("/profiles/{profile_id}/challenge-response")
     def verify_challenge(profile_id: str, body: dict[str, Any], request: Request) -> dict[str, bool]:
         enforce_rate_limit(request, "profile-verify")
@@ -1330,6 +1605,7 @@ def create_app(
                 profile_id,
                 str(body["challenge_id"]),
                 str(body["signature"]),
+                challenge_type="profile",
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1338,8 +1614,11 @@ def create_app(
         return {"verified": verified}
 
     @app.post("/profiles/{profile_id}/site-access-requests")
-    def create_site_access_request(profile_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+    def create_site_access_request(profile_id: str, body: dict[str, Any], request: Request,
+        partner_site: str | None = Depends(require_partner)) -> dict[str, Any]:
         enforce_rate_limit(request, "access-request-create")
+        if partner_site is not None and body.get("site_id") != partner_site:
+            raise HTTPException(status_code=403, detail="Site credential does not match the requested site.")
         try:
             has_explicit_scope_tiers = "required_scopes" in body or "optional_scopes" in body
             if has_explicit_scope_tiers and "requested_scopes" in body:
@@ -1378,9 +1657,10 @@ def create_app(
         }
 
     @app.get("/site-access-requests/{request_id}")
-    def get_site_access_request(request_id: str, request: Request) -> dict[str, Any]:
+    def get_site_access_request(request_id: str, request: Request,
+        partner_site: str | None = Depends(require_partner)) -> dict[str, Any]:
         try:
-            profile_id, access_request = store.get_access_request(request_id)
+            profile_id, access_request = store.get_access_request(request_id, site_id=partner_site)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return {
@@ -1399,6 +1679,17 @@ def create_app(
                 profile_id=profile_id,
             )
         )
+
+    @app.post("/grants/{grant_id}/revoke")
+    def revoke_grant(grant_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+        enforce_rate_limit(request, "grant-revoke")
+        try:
+            grant = perform_owner_action("revoke", grant_id, body)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {"grant": grant.to_dict()}
 
     @app.get("/consent/grants", response_class=HTMLResponse)
     def get_consent_grants_page(request: Request, profile_id: str | None = Query(default=None)) -> HTMLResponse:
@@ -1428,11 +1719,7 @@ def create_app(
         enforce_rate_limit(request, "grant-revoke")
         payload = body or {}
         try:
-            grant = store.revoke_grant(
-                grant_id,
-                actor=str(payload.get("actor", "browser-consent-ui")),
-                reason=str(payload["reason"]) if payload.get("reason") is not None else None,
-            )
+            grant = perform_owner_action("revoke", grant_id, payload)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:
@@ -1510,18 +1797,7 @@ def create_app(
         enforce_rate_limit(request, "access-request-approve")
         payload = body or {}
         try:
-            access_request, grant = store.approve_access_request(
-                request_id,
-                approved_scopes=[str(scope) for scope in payload.get("approved_scopes", [])]
-                if payload.get("approved_scopes") is not None
-                else None,
-                grant_expires_at=(
-                    str(payload["grant_expires_at"])
-                    if payload.get("grant_expires_at") is not None
-                    else None
-                ),
-                actor=str(payload.get("actor", "browser-consent-ui")),
-            )
+            access_request, grant = perform_owner_action("approve", request_id, payload)
             profile_id, _ = store.get_access_request(request_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1546,11 +1822,7 @@ def create_app(
         enforce_rate_limit(request, "access-request-deny")
         payload = body or {}
         try:
-            access_request = store.deny_access_request(
-                request_id,
-                reason=str(payload["reason"]) if payload.get("reason") is not None else None,
-                actor=str(payload.get("actor", "browser-consent-ui")),
-            )
+            access_request = perform_owner_action("deny", request_id, payload)
             profile_id, _ = store.get_access_request(request_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1583,7 +1855,11 @@ def create_app(
     @app.post("/lens/profiles/import")
     def import_profile_lens_profile(body: dict[str, Any], request: Request) -> dict[str, Any]:
         require_local_browser(request)
+        enforce_rate_limit(request, "profile-write")
         try:
+            raw_profile = body["profile"]
+            if isinstance(raw_profile, dict):
+                enforce_item_limit(raw_profile.get("event_log"), config.max_profile_events, "Profile event count")
             profile = ORFProfile.from_document(body["profile"])
             saved = store.save_profile(profile)
         except (KeyError, TypeError, ValueError, InvalidSignature) as error:
@@ -1628,18 +1904,7 @@ def create_app(
         enforce_rate_limit(request, "access-request-approve")
         payload = body or {}
         try:
-            access_request, grant = store.approve_access_request(
-                request_id,
-                approved_scopes=[str(scope) for scope in payload.get("approved_scopes", [])]
-                if payload.get("approved_scopes") is not None
-                else None,
-                grant_expires_at=(
-                    str(payload["grant_expires_at"])
-                    if payload.get("grant_expires_at") is not None
-                    else None
-                ),
-                actor=str(payload.get("actor", "cli")),
-            )
+            access_request, grant = perform_owner_action("approve", request_id, payload)
             profile_id, _ = store.get_access_request(request_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1660,11 +1925,7 @@ def create_app(
         enforce_rate_limit(request, "access-request-deny")
         payload = body or {}
         try:
-            access_request = store.deny_access_request(
-                request_id,
-                reason=str(payload["reason"]) if payload.get("reason") is not None else None,
-                actor=str(payload.get("actor", "cli")),
-            )
+            access_request = perform_owner_action("deny", request_id, payload)
             profile_id, _ = store.get_access_request(request_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1676,9 +1937,11 @@ def create_app(
         }
 
     @app.post("/site-access-requests/{request_id}/exchange")
-    def begin_site_access_exchange(request_id: str, request: Request) -> dict[str, Any]:
+    def begin_site_access_exchange(request_id: str, request: Request,
+        partner_site: str | None = Depends(require_partner)) -> dict[str, Any]:
         enforce_rate_limit(request, "grant-exchange")
         try:
+            store.get_access_request(request_id, site_id=partner_site)
             access_request, grant, challenge = store.begin_grant_exchange(request_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1692,9 +1955,11 @@ def create_app(
         }
 
     @app.post("/site-access-requests/{request_id}/verify")
-    def verify_site_access_exchange(request_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+    def verify_site_access_exchange(request_id: str, body: dict[str, Any], request: Request,
+        partner_site: str | None = Depends(require_partner)) -> dict[str, Any]:
         enforce_rate_limit(request, "grant-verify")
         try:
+            store.get_access_request(request_id, site_id=partner_site)
             grant, session = store.exchange_grant_session(
                 request_id,
                 challenge_id=str(body["challenge_id"]),
@@ -1716,10 +1981,11 @@ def create_app(
         }
 
     @app.get("/grant-sessions/{session_id}/projection")
-    def get_grant_session_projection(session_id: str, request: Request) -> dict[str, Any]:
+    def get_grant_session_projection(session_id: str, request: Request,
+        partner_site: str | None = Depends(require_partner)) -> dict[str, Any]:
         enforce_rate_limit(request, "projection-read")
         try:
-            session = store.get_grant_session(session_id)
+            session = store.get_grant_session(session_id, site_id=partner_site)
             projection = store.get_consented_projection(session_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1735,10 +2001,12 @@ def create_app(
         session_id: str,
         body: dict[str, Any],
         request: Request,
+        partner_site: str | None = Depends(require_partner),
     ) -> dict[str, Any]:
         enforce_rate_limit(request, "ranking-read")
+        enforce_item_limit(body.get("candidates"), config.max_ranking_candidates, "Ranking candidate count")
         try:
-            session = store.get_grant_session(session_id)
+            session = store.get_grant_session(session_id, site_id=partner_site)
             ranking_request = GrantSessionRankRequest.from_dict(
                 body,
                 default_schema_version=session.schema_version,
@@ -1758,10 +2026,12 @@ def create_app(
         session_id: str,
         body: dict[str, Any],
         request: Request,
+        partner_site: str | None = Depends(require_partner),
     ) -> dict[str, Any]:
         enforce_rate_limit(request, "ranking-feedback-write")
+        enforce_item_limit(body.get("events"), config.max_feedback_batch, "Feedback batch count")
         try:
-            session = store.get_grant_session(session_id)
+            session = store.get_grant_session(session_id, site_id=partner_site)
             feedback_request = GrantSessionFeedbackRequest.from_dict(
                 body,
                 default_schema_version=session.schema_version,
@@ -1805,6 +2075,7 @@ def create_app(
                 profile_id,
                 str(body["challenge_id"]),
                 str(body["signature"]),
+                challenge_type="profile",
             )
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error

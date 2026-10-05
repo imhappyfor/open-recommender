@@ -40,8 +40,11 @@ private/
 # Copilot agent session state
 .agents/
 
-# Local agent/skill configuration (do not publish)
-.github/
+# Local agent/skill configuration stays private; only the release test workflow is public.
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/tests.yml
 
 # Copilot skills
 .skills/
@@ -57,3 +60,6 @@ private/
 
 # macOS
 .DS_Store
+.build/
+DerivedData/
+xcuserdata/

@@ -94,9 +94,8 @@ Representative output:
     "share_public_topics": true
   },
   "display_name": "Alice Example",
-  "opt_out_topics": [],
   "profile_id": "orf:profile:70075877fb450ebfc1acce86f6879e08",
-  "schema_version": "0.1.0",
+  "schema_version": "0.2.0",
   "topics": [
     {
       "topic": "orf:technology/python",
@@ -344,7 +343,7 @@ python -m open_recommender.cli site-access-request-get $REQUEST_ID http://127.0.
 Approve only the scopes the user wants to grant:
 
 ```bash
-python -m open_recommender.cli site-access-request-approve $REQUEST_ID http://127.0.0.1:8000 \
+python -m open_recommender.cli site-access-request-approve $REQUEST_ID http://127.0.0.1:8000 --profile-path .poc-work/profile.orf \
   --scope profile.read \
   --scope topics.public \
   --scope topics.selective:orf:media/podcasts

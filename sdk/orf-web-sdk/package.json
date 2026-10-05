@@ -2,6 +2,11 @@
   "name": "@open-recommender/orf-web-sdk",
   "version": "0.1.0",
   "description": "Browser-friendly ESM client for the Open Recommender hosted ORF service.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imhappyfor/open-recommender.git",
+    "directory": "sdk/orf-web-sdk"
+  },
   "type": "module",
   "scripts": {
     "test": "node --test"

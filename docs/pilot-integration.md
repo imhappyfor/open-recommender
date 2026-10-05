@@ -74,8 +74,62 @@ request_id = created["access_request"]["request_id"]
 Important boundary:
 
 - this SDK is site-side only and does not include key handling
+- its raw sync helpers are owner-side utilities, not site permissions: `pull_events`
+  requires a fresh `sync-read` owner proof bound to the profile and `after_clock`
 - the user-side ORF client still signs `challenge_payload` outside the site process
 - unknown fields returned by the service are preserved as-is in response JSON payloads
+
+### Backend credentials
+
+The examples below use the unauthenticated localhost preview. To authenticate
+site backends, generate a different token for every registered site. For one site:
+
+```sh
+export ORF_SITE_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export OPEN_RECOMMENDER_SITE_TOKEN_HASHES="$(python -c 'import hashlib,json,os; print(json.dumps({"open-news-demo": hashlib.sha256(os.environ["ORF_SITE_TOKEN"].encode()).hexdigest()}))')"
+python -m uvicorn open_recommender.service:create_app --factory --host 127.0.0.1
+```
+
+Give the raw token only to that site's backend; the service needs only its hash.
+Keep both settings in protected operator configuration, never the site registry,
+source control, browser bundle, URL, or logs. In that backend:
+
+```python
+import os
+from open_recommender.partner_sdk import PartnerClient
+
+sdk = PartnerClient("http://127.0.0.1:8000", site_id="open-news-demo",
+                    site_token=os.environ["ORF_SITE_TOKEN"])
+```
+
+All seven partner operations send `X-ORF-Site-ID` and `X-ORF-Site-Token`; owner
+sync helpers do not. Custom `send_json` transports must accept the optional
+`extra_headers` keyword and must not forward credentials through redirects.
+The built-in transport rejects credentialed redirects and uses a 30-second timeout.
+Use HTTPS with normal certificate verification outside localhost.
+
+Rotate or remove a token by changing the hash map and restarting all workers;
+existing sessions immediately require the new credential on those workers.
+An empty map denies all partner calls. Bad configuration fails startup.
+Tokens prove backend possession, not a site's domain or the user's approval.
+
+All three Python examples read `ORF_SITE_TOKEN` from the environment. With the
+credential above still available in protected configuration, run:
+
+```sh
+python examples/pilot_dry_run.py http://127.0.0.1:8000
+```
+
+The dry-run also reads the separate `OPEN_RECOMMENDER_SYNC_TOKEN` gate when set.
+It creates synthetic preferences, signs owner decisions locally, checks scoped
+access, and verifies revocation. Neither token appears in its report. The script
+retains its synthetic profile in the service; it is not a cleanup or load test.
+
+When this gate is enabled, the browser SDK and site-inspection CLI commands cannot
+call partner endpoints directly. Mediate them through the site's backend; never
+give the browser a backend token. Owner signing stays in the user's trusted client.
+The local `/consent` review pages and owner-proof APIs remain separate. This gate
+does not make those localhost-only review pages a remote consent application.
 
 Current localhost constraint:
 
@@ -139,7 +193,7 @@ The current browser review page is intentionally narrow:
 Approve:
 
 ```bash
-python -m open_recommender.cli site-access-request-approve <request_id> http://127.0.0.1:8000 \
+python -m open_recommender.cli site-access-request-approve <request_id> http://127.0.0.1:8000 --profile-path profile.orf \
   --scope profile.read \
   --scope topics.public \
   --scope topics.selective:orf:media/podcasts
@@ -148,13 +202,15 @@ python -m open_recommender.cli site-access-request-approve <request_id> http://1
 Or deny:
 
 ```bash
-python -m open_recommender.cli site-access-request-deny <request_id> http://127.0.0.1:8000 \
+python -m open_recommender.cli site-access-request-deny <request_id> http://127.0.0.1:8000 --profile-path profile.orf \
   --reason "User declined this pilot request."
 ```
 
 Approval rules in the current repo:
 
 - approved scopes must be a subset of the request
+- approval and denial require a one-time owner signature bound to the request and exact decision parameters
+- CLI decisions require `--profile-path` and its matching key; browser decisions require choosing an unencrypted key in tab memory
 - site-specific allowed scopes are enforced
 - denied or expired requests cannot move into exchange
 - private topics never become grantable through this flow
@@ -238,14 +294,14 @@ For a more realistic run, omit `--auto-approve`, open the printed `consent_revie
 The repo also includes a tiny sample adopter app:
 
 ```bash
-uvicorn examples.sample_site:app --reload --port 9001
+uvicorn examples.sample_site:app --reload --host 127.0.0.1 --port 9001
 ```
 
 Optional localhost-only demo signer mode:
 
 ```bash
 export SAMPLE_SITE_DEMO_SIGNER_KEY_PATH=profile.orf.key
-uvicorn examples.sample_site:app --reload --port 9001
+uvicorn examples.sample_site:app --reload --host 127.0.0.1 --port 9001
 ```
 
 Open:
@@ -260,8 +316,19 @@ What the sample site proves:
 - the user is redirected into the localhost trust app for approval
 - after approval, the site can complete exchange and read the consented projection
 
+Choose **Open consent review** to decide sharing in a new tab, then return and
+choose **Check approval status**. Denied or expired requests offer **Start again**.
+With the local demo signer enabled, an approved request offers **Preview shared
+preferences**. That page shows a previously returned projection, not a ranked feed
+or a live permission check. Revocation stops new reads, not this saved copy.
+Request IDs and scope strings remain available under **Technical request details**.
+
 Important boundary:
 
+- `ORF_SITE_TOKEN` stays in this app's backend and is never rendered in browser pages
+- all sample routes require localhost; responses disable caching and escape user-controlled text
+- sessions live in process memory and disappear on restart; there is no production user-session or retention policy
+- do not expose the sample through a proxy that makes remote clients appear local
 - without `SAMPLE_SITE_DEMO_SIGNER_KEY_PATH`, the sample site stops after approval and expects an external signer flow
 - with `SAMPLE_SITE_DEMO_SIGNER_KEY_PATH`, the sample can finish the challenge locally only to validate the protocol on one machine
 - that demo signer mode is **not** a valid production pattern and must never be copied into a real third-party site
@@ -436,7 +503,7 @@ http://127.0.0.1:8000/consent/grants
 
 Revocation behavior:
 
-- active grants can be revoked from the browser trust app
+- active grants can be revoked from the browser trust app with the matching signing key, or through `site-grant-revoke --profile-path profile.orf`
 - revoked grants are recorded in audit events as `grant.revoked`
-- revoked grants cannot mint new exchange sessions
+- revoked or expired grants cannot mint new exchange sessions or use existing sessions for projections, ranking, or feedback
 - sites must create a new access request and get fresh approval to regain access

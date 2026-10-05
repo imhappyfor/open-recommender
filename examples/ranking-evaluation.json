@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "synthetic": true,
+  "as_of": "2026-10-01T00:00:00Z",
+  "k": 2,
+  "cases": [
+    {
+      "case_id": "useful-transfer",
+      "granted_topic_weights": {"orf:technology/python": 1.0},
+      "candidates": [
+        {"candidate_id": "generic", "site_score": 0.9, "candidate_topics": ["orf:news"]},
+        {"candidate_id": "python", "site_score": 0.82, "candidate_topics": ["orf:technology/python"]},
+        {"candidate_id": "python-deep-dive", "site_score": 0.75, "candidate_topics": ["orf:technology/python"]}
+      ],
+      "relevance": {"generic": 0, "python": 3, "python-deep-dive": 2}
+    },
+    {
+      "case_id": "stale-preference",
+      "granted_topic_weights": {"orf:technology/python": 1.0},
+      "candidates": [
+        {"candidate_id": "today-interest", "site_score": 0.9, "candidate_topics": ["orf:science"]},
+        {"candidate_id": "old-interest", "site_score": 0.8, "candidate_topics": ["orf:technology/python"]},
+        {"candidate_id": "unrelated", "site_score": 0.4, "candidate_topics": ["orf:media"]}
+      ],
+      "relevance": {"today-interest": 3, "old-interest": 0, "unrelated": 0}
+    },
+    {
+      "case_id": "cold-start",
+      "granted_topic_weights": {},
+      "candidates": [
+        {"candidate_id": "first", "site_score": 0.9},
+        {"candidate_id": "second", "site_score": 0.6},
+        {"candidate_id": "third", "site_score": 0.3}
+      ],
+      "relevance": {"first": 3, "second": 1, "third": 0}
+    },
+    {
+      "case_id": "freshness-only",
+      "granted_topic_weights": {},
+      "candidates": [
+        {"candidate_id": "stale", "site_score": 0.85, "published_at": "2026-09-01T00:00:00Z"},
+        {"candidate_id": "recent", "site_score": 0.8, "published_at": "2026-10-01T00:00:00Z"},
+        {"candidate_id": "other", "site_score": 0.2}
+      ],
+      "relevance": {"stale": 0, "recent": 3, "other": 0}
+    },
+    {
+      "case_id": "no-relevant-candidates",
+      "granted_topic_weights": {"orf:science": 0.5},
+      "candidates": [
+        {"candidate_id": "one", "site_score": 0.8},
+        {"candidate_id": "two", "site_score": 0.7}
+      ],
+      "relevance": {"one": 0, "two": 0}
+    }
+  ]
+}

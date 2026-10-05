@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "ORF Gateway",
+  "version": "0.1.0",
+  "description": "Request a site-specific ORF login through the native app. No profile uploads.",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*", "http://[::1]/*"],
+  "background": {"scripts": ["background.js"], "persistent": false},
+  "content_scripts": [{
+    "matches": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*", "http://[::1]/*"],
+    "js": ["content.js"],
+    "all_frames": false,
+    "run_at": "document_start"
+  }],
+  "action": {"default_title": "ORF Gateway", "default_popup": "popup.html"}
+}

@@ -7,11 +7,11 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from .crypto import fingerprint_public_key
+from .crypto import JCS_SIGNATURE_ENCODING, canonical_signed_json, fingerprint_public_key, verify_signature
 from .recommender import AggregatedFeed, AggregatedRecommendation, RecommendationItem
 
 
-CURRENT_PROFILE_SCHEMA_VERSION = "0.1.0"
+CURRENT_PROFILE_SCHEMA_VERSION = "0.2.0"
 CURRENT_CONTRACT_SCHEMA_VERSION = "0.3.0"
 SELECTIVE_TOPIC_SCOPE_PREFIX = "topics.selective:"
 
@@ -20,7 +20,22 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def validate_timestamp(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Timestamp must be an ISO 8601 string with a timezone.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("Timezone is missing.")
+        parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError) as error:
+        raise ValueError("Timestamp must be ISO 8601 with a representable UTC timezone.") from error
+    return value
+
+
 def validate_topic_name(topic: str) -> str:
+    if not isinstance(topic, str):
+        raise ValueError("Topic names must be strings.")
     namespace, separator, path = topic.partition(":")
     if not separator or not namespace or not path:
         raise ValueError("Topic names must use namespaced format like 'orf:technology/python'.")
@@ -471,6 +486,10 @@ class TopicPreference:
     visibility: Visibility
     updated_at: str
 
+    def __post_init__(self) -> None:
+        if type(self.weight) not in (int, float) or not 0.0 <= self.weight <= 1.0:
+            raise ValueError("Topic weight must be a finite number between 0.0 and 1.0.")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "topic": self.topic,
@@ -481,9 +500,11 @@ class TopicPreference:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TopicPreference":
+        if not isinstance(data, dict):
+            raise ValueError("Topic preference must be an object.")
         return cls(
-            topic=validate_topic_name(str(data["topic"])),
-            weight=float(data["weight"]),
+            topic=validate_topic_name(data["topic"]),
+            weight=data["weight"],
             visibility=Visibility(data["visibility"]),
             updated_at=str(data["updated_at"]),
         )
@@ -495,6 +516,10 @@ class ConsentSettings:
     ad_personalization: bool = True
     hosted_sync: bool = True
 
+    def __post_init__(self) -> None:
+        if any(type(value) is not bool for value in self.to_dict().values()):
+            raise ValueError("Consent settings must be booleans.")
+
     def to_dict(self) -> dict[str, bool]:
         return {
             "share_public_topics": self.share_public_topics,
@@ -504,10 +529,12 @@ class ConsentSettings:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ConsentSettings":
+        if not isinstance(data, dict):
+            raise ValueError("Consent settings must be an object.")
         return cls(
-            share_public_topics=bool(data.get("share_public_topics", True)),
-            ad_personalization=bool(data.get("ad_personalization", True)),
-            hosted_sync=bool(data.get("hosted_sync", True)),
+            share_public_topics=data.get("share_public_topics", True),
+            ad_personalization=data.get("ad_personalization", True),
+            hosted_sync=data.get("hosted_sync", True),
         )
 
 
@@ -530,9 +557,19 @@ class SyncState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SyncState":
+        if not isinstance(data, dict) or not isinstance(data.get("device_id"), str):
+            raise ValueError("Sync state must be an object with a string device_id.")
+        clocks = [data.get("last_clock", 0)]
+        for name in ("topic_clocks", "consent_clocks", "opt_out_clocks"):
+            values = data.get(name, {})
+            if not isinstance(values, dict):
+                raise ValueError(f"Sync {name} must be an object.")
+            clocks.extend(values.values())
+        if any(type(clock) is not int or not 0 <= clock <= 2**53 - 1 for clock in clocks):
+            raise ValueError("Sync clocks must be non-negative safe integers.")
         return cls(
-            device_id=str(data["device_id"]),
-            last_clock=int(data.get("last_clock", 0)),
+            device_id=data["device_id"],
+            last_clock=data.get("last_clock", 0),
             topic_clocks={str(key): int(value) for key, value in data.get("topic_clocks", {}).items()},
             consent_clocks={
                 str(key): int(value) for key, value in data.get("consent_clocks", {}).items()
@@ -553,9 +590,64 @@ class SignedEvent:
     op: EventOp
     payload: dict[str, Any]
     signature: str
+    signature_encoding: str | None = None
+
+    def validate(self) -> None:
+        for name in ("event_id", "profile_id", "device_id", "timestamp"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Event {name} must be a non-empty string.")
+        if type(self.clock) is not int or not 0 <= self.clock <= 2**53 - 1:
+            raise ValueError("Event clock must be a non-negative safe integer.")
+        if not isinstance(self.signature, str) or not isinstance(self.op, EventOp):
+            raise ValueError("Event signature and operation must be strings.")
+        validate_timestamp(self.timestamp)
+        if not isinstance(self.payload, dict):
+            raise ValueError("Event payload must be an object.")
+        payload = self.payload
+        if self.op in {EventOp.SET_TOPIC, EventOp.REMOVE_TOPIC, EventOp.SET_OPT_OUT}:
+            validate_topic_name(payload.get("topic"))
+        if self.op == EventOp.SET_TOPIC:
+            weight = payload.get("weight")
+            if type(weight) not in (int, float) or not 0.0 <= weight <= 1.0:
+                raise ValueError("Topic weight must be a finite number between 0.0 and 1.0.")
+            try:
+                Visibility(payload.get("visibility"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("Topic visibility must be public, selective, or private.") from error
+        elif self.op in {EventOp.SET_CONSENT, EventOp.SET_OPT_OUT}:
+            if type(payload.get("value")) is not bool:
+                raise ValueError("Consent and opt-out values must be booleans.")
+            if self.op == EventOp.SET_CONSENT and payload.get("field") not in (
+                "share_public_topics", "ad_personalization", "hosted_sync"
+            ):
+                raise ValueError("Unknown consent field.")
+        elif self.op == EventOp.SET_PROFILE:
+            if not isinstance(payload.get("display_name"), str):
+                raise ValueError("Profile display_name must be a string.")
+            if self.clock == 0:
+                if not isinstance(payload.get("schema_version"), str):
+                    raise ValueError("Registration schema_version must be a string.")
+                ensure_supported_schema_version(payload["schema_version"], current_version=CURRENT_PROFILE_SCHEMA_VERSION)
+                if payload.get("created_at") != self.timestamp:
+                    raise ValueError("Registration created_at must match its signed timestamp.")
+        elif self.op == EventOp.RECOMMEND:
+            for name in ("item_id", "site_id"):
+                if not isinstance(payload.get(name), str) or not payload[name].strip():
+                    raise ValueError(f"Recommendation {name} must be a non-empty string.")
+            score = payload.get("score", 0.5)
+            if type(score) not in (int, float) or not 0.0 <= score <= 1.0:
+                raise ValueError("Recommendation score must be a finite number between 0.0 and 1.0.")
+            if not isinstance(payload.get("metadata", {}), dict):
+                raise ValueError("Recommendation metadata must be an object.")
+            if "timestamp" in payload:
+                validate_timestamp(payload["timestamp"])
+        if self.signature_encoding not in (None, JCS_SIGNATURE_ENCODING):
+            raise ValueError("Unsupported signature encoding.")
+        canonical_signed_json(self.unsigned_payload())
 
     def unsigned_payload(self) -> dict[str, Any]:
-        return {
+        data = {
             "event_id": self.event_id,
             "profile_id": self.profile_id,
             "device_id": self.device_id,
@@ -564,6 +656,9 @@ class SignedEvent:
             "op": self.op.value,
             "payload": self.payload,
         }
+        if self.signature_encoding is not None:
+            data["signature_encoding"] = self.signature_encoding
+        return data
 
     def to_dict(self) -> dict[str, Any]:
         data = self.unsigned_payload()
@@ -572,16 +667,26 @@ class SignedEvent:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SignedEvent":
-        return cls(
-            event_id=str(data["event_id"]),
-            profile_id=str(data["profile_id"]),
-            device_id=str(data["device_id"]),
-            clock=int(data["clock"]),
-            timestamp=str(data["timestamp"]),
-            op=EventOp(str(data["op"])),
+        fields = {"event_id", "profile_id", "device_id", "clock", "timestamp", "op", "payload", "signature"}
+        if not isinstance(data, dict) or not fields.issubset(data):
+            raise ValueError("Event must be an object containing all signed fields and signature.")
+        if not isinstance(data["payload"], dict):
+            raise ValueError("Event payload must be an object.")
+        if "signature_encoding" in data and data["signature_encoding"] != JCS_SIGNATURE_ENCODING:
+            raise ValueError("Unsupported signature encoding.")
+        event = cls(
+            event_id=data["event_id"],
+            profile_id=data["profile_id"],
+            device_id=data["device_id"],
+            clock=data["clock"],
+            timestamp=data["timestamp"],
+            op=EventOp(data["op"]),
             payload=dict(data["payload"]),
-            signature=str(data["signature"]),
+            signature=data["signature"],
+            signature_encoding=data.get("signature_encoding"),
         )
+        event.validate()
+        return event
 
 
 @dataclass(slots=True)
@@ -614,6 +719,41 @@ class ORFProfile:
     def next_clock(self) -> int:
         return self.sync.last_clock + 1
 
+    def rebuild_from_verified_history(self) -> "ORFProfile":
+        # ponytail: replay full history; add verified checkpoints if history size makes this slow.
+        registrations = [event for event in self.event_log if event.clock == 0]
+        if len(registrations) != 1:
+            raise ValueError(
+                "A signed clock-zero registration event is required. "
+                "Run sync-push with the matching key to upgrade older profiles."
+            )
+        registration = registrations[0]
+        registration.validate()
+        if registration.op != EventOp.SET_PROFILE:
+            raise ValueError("Registration must be a set_profile event.")
+        metadata = registration.payload
+        ensure_supported_schema_version(
+            str(metadata["schema_version"]), current_version=self.schema_version
+        )
+        if metadata["created_at"] != registration.timestamp:
+            raise ValueError("Registration created_at must match its signed timestamp.")
+
+        rebuilt = ORFProfile(
+            schema_version=str(metadata["schema_version"]),
+            profile_id=self.profile_id,
+            display_name=str(metadata["display_name"]),
+            public_key=self.public_key,
+            created_at=registration.timestamp,
+            updated_at=registration.timestamp,
+            sync=SyncState(device_id=registration.device_id),
+        )
+        for event in sorted(self.event_log, key=lambda item: (item.clock, item.timestamp, item.event_id)):
+            if event.clock < 0:
+                raise ValueError("Event clock must be non-negative.")
+            verify_signature(event.unsigned_payload(), event.signature, self.public_key)
+            rebuilt.apply_event(event)
+        return rebuilt
+
     def to_document(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -631,6 +771,14 @@ class ORFProfile:
 
     @classmethod
     def from_document(cls, data: dict[str, Any]) -> "ORFProfile":
+        if not isinstance(data, dict):
+            raise ValueError("Profile must be an object.")
+        for name in ("schema_version", "profile_id", "display_name", "public_key", "created_at", "updated_at"):
+            if not isinstance(data.get(name), str):
+                raise ValueError(f"Profile {name} must be a string.")
+        for name in ("topics", "opt_out_topics", "event_log"):
+            if name in data and not isinstance(data[name], list):
+                raise ValueError(f"Profile {name} must be an array.")
         ensure_supported_schema_version(
             str(data["schema_version"]), current_version=CURRENT_PROFILE_SCHEMA_VERSION
         )
@@ -667,7 +815,6 @@ class ORFProfile:
             "profile_id": self.profile_id,
             "display_name": self.display_name,
             "topics": topics,
-            "opt_out_topics": sorted(self.opt_out_topics),
             "consent": {
                 "share_public_topics": self.consent.share_public_topics,
                 "ad_personalization": self.consent.ad_personalization,
@@ -732,6 +879,9 @@ class ORFProfile:
         self.event_log.append(event)
 
     def apply_event(self, event: SignedEvent) -> None:
+        event.validate()
+        if parse_schema_version(self.schema_version) >= (0, 2, 0) and event.signature_encoding != JCS_SIGNATURE_ENCODING:
+            raise ValueError("Profile schema 0.2+ requires JCS-signed events.")
         if event.profile_id != self.profile_id:
             raise ValueError("Event profile ID does not match profile.")
 
@@ -803,6 +953,7 @@ def build_signed_event(
     *,
     clock: int | None = None,
     timestamp: str | None = None,
+    signature_encoding: str | None = JCS_SIGNATURE_ENCODING,
 ) -> SignedEvent:
     return SignedEvent(
         event_id=str(uuid4()),
@@ -813,5 +964,21 @@ def build_signed_event(
         op=op,
         payload=payload,
         signature=signature,
+        signature_encoding=signature_encoding,
     )
 
+
+def build_registration_event(profile: ORFProfile) -> SignedEvent:
+    """Clock-zero identity metadata, signed by the user before hosted registration."""
+    return build_signed_event(
+        profile,
+        EventOp.SET_PROFILE,
+        {
+            "display_name": profile.display_name,
+            "created_at": profile.created_at,
+            "schema_version": profile.schema_version,
+        },
+        signature="",
+        clock=0,
+        timestamp=profile.created_at,
+    )

@@ -1,0 +1,14 @@
+OPEN RECOMMENDER — LOGO KIT
+
+Three layouts: symbol, horizontal, stacked.
+Four treatments: on-dark, on-light, black, white.
+SVG: scalable vector artwork; all lettering is outlined. No font installation needed.
+PNG: transparent backgrounds; symbols 1024px, horizontal 3240px, stacked 2400px.
+Icons: 16–1024px, SVG app icon, and multi-size favicon.ico.
+
+Use on-dark over midnight or other dark backgrounds; on-light over white or pale backgrounds.
+Use black/white when only one ink color is available.
+Keep clear space around the artwork. Do not stretch, recolor, or rotate the mark.
+Primary palette: mint #6ee7b7, midnight #080f1a, off-white #eff6f5.
+Light-background mark: deep teal #08795d.
+Motion accents: coral #ff919e, gold #ffd07e, sky #6dbfff.

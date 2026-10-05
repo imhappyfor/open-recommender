@@ -9,8 +9,9 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from open_recommender.crypto import generate_key_pair, sign_payload
-from open_recommender.models import EventOp, ORFProfile, build_signed_event
+from open_recommender.models import EventOp, ORFProfile, build_registration_event, build_signed_event
 from open_recommender.service import create_app
+from owner_helpers import owner_post
 
 
 class ServiceTests(unittest.TestCase):
@@ -21,6 +22,9 @@ class ServiceTests(unittest.TestCase):
         self.client = TestClient(self.app)
         self.private_key, public_key = generate_key_pair()
         self.profile = ORFProfile.create("Alice", public_key, "device-a")
+        registration = build_registration_event(self.profile)
+        registration.signature = sign_payload(registration.unsigned_payload(), self.private_key)
+        self.profile.apply_event(registration)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -86,6 +90,58 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(post_response.status_code, 200)
         self.assertEqual(post_response.headers.get("access-control-allow-origin"), origin)
 
+    def test_opt_out_names_stay_in_owner_history_not_public_surfaces(self) -> None:
+        for version in ("0.1.0", "0.2.0"):
+            with self.subTest(version=version):
+                key, public_key = generate_key_pair()
+                profile = ORFProfile.create("Synthetic", public_key, "test")
+                profile.schema_version = version
+                registration = build_registration_event(profile)
+                if version == "0.1.0":
+                    registration.signature_encoding = None
+                registration.signature = sign_payload(registration.unsigned_payload(), key)
+                profile.apply_event(registration)
+                hidden = ("orf:health/private-condition", "orf:politics/selective", "orf:health/never-shared")
+                for topic, visibility in zip(hidden[:2], ("private", "selective")):
+                    event = build_signed_event(profile, EventOp.SET_TOPIC,
+                        {"topic": topic, "weight": 0.9, "visibility": visibility}, "",
+                        signature_encoding=registration.signature_encoding)
+                    event.signature = sign_payload(event.unsigned_payload(), key)
+                    profile.apply_event(event)
+                for topic in hidden:
+                    event = build_signed_event(profile, EventOp.SET_OPT_OUT, {"topic": topic, "value": True}, "",
+                        signature_encoding=registration.signature_encoding)
+                    event.signature = sign_payload(event.unsigned_payload(), key)
+                    profile.apply_event(event)
+                original = profile.to_document()
+                registered = self.client.post("/profiles", json={"profile": original})
+                self.assertEqual(registered.status_code, 200, registered.text)
+                responses = [registered]
+                for sharing in (True, False):
+                    event = build_signed_event(profile, EventOp.SET_CONSENT,
+                        {"field": "share_public_topics", "value": sharing}, "",
+                        signature_encoding=registration.signature_encoding)
+                    event.signature = sign_payload(event.unsigned_payload(), key)
+                    profile.apply_event(event)
+                    responses.append(self.client.post(f"/profiles/{profile.profile_id}/events",
+                        json={"events": [event.to_dict()]}))
+                    for suffix in (f"/profiles/{profile.profile_id}/public", f"/demo/site/{profile.profile_id}"):
+                        responses.append(self.client.get(suffix))
+                for response in responses:
+                    self.assertEqual(response.status_code, 200, response.text)
+                    projection = response.json().get("public_profile", response.json())
+                    self.assertNotIn("opt_out_topics", projection)
+                    for topic in hidden:
+                        self.assertNotIn(topic, response.text)
+                saved = self.app.state.store.get_profile(profile.profile_id)
+                self.assertEqual(saved.opt_out_topics, set(hidden))
+                self.assertEqual(saved.to_document()["event_log"][:len(original["event_log"])], original["event_log"])
+                owner_read = owner_post(self.client, profile, key,
+                    f"/profiles/{profile.profile_id}/events/read", json={"after_clock": 0})
+                self.assertEqual(owner_read.status_code, 200, owner_read.text)
+                self.assertEqual({event["payload"]["topic"] for event in owner_read.json()["events"]
+                    if event["op"] == "set_opt_out"}, set(hidden))
+
     def test_events_and_challenge_flow(self) -> None:
         self.client.post("/profiles", json={"profile": self.profile.to_document()})
         event = build_signed_event(
@@ -102,7 +158,8 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(event_response.status_code, 200)
 
-        pull_response = self.client.get(f"/profiles/{self.profile.profile_id}/events?after_clock=0")
+        pull_response = owner_post(self.client, self.profile, self.private_key,
+            f"/profiles/{self.profile.profile_id}/events/read", json={"after_clock": 0})
         self.assertEqual(pull_response.status_code, 200)
         self.assertEqual(len(pull_response.json()["events"]), 1)
 
@@ -240,7 +297,7 @@ class ServiceTests(unittest.TestCase):
             ["unknown.scope"],
         )
 
-        approve_response = self.client.post(
+        approve_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/approve",
             json={
                 "approved_scopes": [
@@ -329,7 +386,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request_response.status_code, 200)
         request_id = request_response.json()["access_request"]["request_id"]
 
-        approve_response = self.client.post(
+        approve_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/approve",
             json={"approved_scopes": ["topics.selective:orf:media/podcasts"]},
         )
@@ -416,7 +473,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request_response.status_code, 200)
         request_id = request_response.json()["access_request"]["request_id"]
 
-        approve_response = self.client.post(
+        approve_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/approve",
             json={"approved_scopes": ["topics.selective:orf:media/podcasts"]},
         )
@@ -596,14 +653,14 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request_response.status_code, 200)
         request_id = request_response.json()["access_request"]["request_id"]
 
-        missing_required_response = self.client.post(
+        missing_required_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/approve",
             json={"approved_scopes": ["topics.public"]},
         )
         self.assertEqual(missing_required_response.status_code, 400)
         self.assertIn("Required scopes cannot be removed", missing_required_response.json()["detail"])
 
-        valid_response = self.client.post(
+        valid_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/approve",
             json={"approved_scopes": ["profile.read"]},
         )
@@ -624,7 +681,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request_response.status_code, 200)
         request_id = request_response.json()["access_request"]["request_id"]
 
-        approve_response = self.client.post(f"/site-access-requests/{request_id}/approve")
+        approve_response = owner_post(self.client, self.profile, self.private_key,
+            f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approve_response.status_code, 200)
 
         exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
@@ -655,7 +713,7 @@ class ServiceTests(unittest.TestCase):
         )
         request_id = request_response.json()["access_request"]["request_id"]
 
-        deny_response = self.client.post(
+        deny_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/deny",
             json={"reason": "User declined this pilot request."},
         )
@@ -685,7 +743,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(inspect_response.status_code, 200)
         self.assertEqual(inspect_response.json()["access_request"]["status"], "expired")
 
-        approve_response = self.client.post(f"/site-access-requests/{request_id}/approve")
+        approve_response = owner_post(self.client, self.profile, self.private_key,
+            f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approve_response.status_code, 400)
         self.assertIn("Only pending requests", approve_response.json()["detail"])
 
@@ -706,7 +765,8 @@ class ServiceTests(unittest.TestCase):
         )
         request_id = request_response.json()["access_request"]["request_id"]
 
-        approve_response = self.client.post(f"/site-access-requests/{request_id}/approve")
+        approve_response = owner_post(self.client, self.profile, self.private_key,
+            f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approve_response.status_code, 200)
 
         exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
@@ -740,7 +800,8 @@ class ServiceTests(unittest.TestCase):
         )
         request_id = request_response.json()["access_request"]["request_id"]
 
-        approve_response = self.client.post(f"/site-access-requests/{request_id}/approve")
+        approve_response = owner_post(self.client, self.profile, self.private_key,
+            f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approve_response.status_code, 200)
 
         exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
@@ -893,7 +954,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(second_token_match)
         self.assertEqual(csrf_token, second_token_match.group(1))
 
-        approve_response = self.client.post(
+        approve_response = owner_post(self.client, self.profile, self.private_key,
             f"/consent/site-access-requests/{request_id}/approve",
             headers={"X-Open-Recommender-CSRF-Token": csrf_token},
             json={
@@ -920,7 +981,7 @@ class ServiceTests(unittest.TestCase):
         )
         request_id = request_response.json()["access_request"]["request_id"]
 
-        missing_token_response = self.client.post(
+        missing_token_response = owner_post(self.client, self.profile, self.private_key,
             f"/consent/site-access-requests/{request_id}/deny",
             json={"reason": "No thanks."},
         )
@@ -931,7 +992,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(token_match)
         csrf_token = token_match.group(1)
 
-        deny_response = self.client.post(
+        deny_response = owner_post(self.client, self.profile, self.private_key,
             f"/consent/site-access-requests/{request_id}/deny",
             headers={"X-Open-Recommender-CSRF-Token": csrf_token},
             json={"reason": "No thanks."},
@@ -1062,7 +1123,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(first_request.status_code, 200)
         first_request_id = first_request.json()["access_request"]["request_id"]
 
-        approve_response = self.client.post(
+        approve_response = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{first_request_id}/approve",
             json={"approved_scopes": ["profile.read", "topics.public"]},
         )
@@ -1099,7 +1160,8 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request_response.status_code, 200)
         request_id = request_response.json()["access_request"]["request_id"]
 
-        approve_response = admin_client.post(f"/site-access-requests/{request_id}/approve")
+        approve_response = owner_post(admin_client, self.profile, self.private_key,
+            f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approve_response.status_code, 200)
         grant_id = approve_response.json()["grant"]["grant_id"]
 
@@ -1116,13 +1178,13 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNotNone(token_match)
         csrf_token = token_match.group(1)
 
-        missing_token_response = admin_client.post(
+        missing_token_response = owner_post(admin_client, self.profile, self.private_key,
             f"/consent/grants/{grant_id}/revoke",
             json={"reason": "No longer needed."},
         )
         self.assertEqual(missing_token_response.status_code, 403)
 
-        revoke_response = admin_client.post(
+        revoke_response = owner_post(admin_client, self.profile, self.private_key,
             f"/consent/grants/{grant_id}/revoke",
             headers={"X-Open-Recommender-CSRF-Token": csrf_token},
             json={"reason": "User revoked site access."},
@@ -1187,6 +1249,9 @@ class SyncTokenGateTests(unittest.TestCase):
         self.client = TestClient(self.app)
         self.private_key, public_key = generate_key_pair()
         self.profile = ORFProfile.create("SyncUser", public_key, "device-sync")
+        registration = build_registration_event(self.profile)
+        registration.signature = sign_payload(registration.unsigned_payload(), self.private_key)
+        self.profile.apply_event(registration)
         self.client.post("/profiles", json={"profile": self.profile.to_document()})
 
     def tearDown(self) -> None:
@@ -1198,12 +1263,13 @@ class SyncTokenGateTests(unittest.TestCase):
         self.assertTrue(response.json()["service"]["sync_auth_required"])
 
     def test_pull_events_blocked_without_token(self) -> None:
-        response = self.client.get(f"/profiles/{self.profile.profile_id}/events")
+        response = owner_post(self.client, self.profile, self.private_key,
+            f"/profiles/{self.profile.profile_id}/events/read", json={"after_clock": 0})
         self.assertEqual(response.status_code, 401)
 
     def test_pull_events_allowed_with_valid_token(self) -> None:
-        response = self.client.get(
-            f"/profiles/{self.profile.profile_id}/events",
+        response = owner_post(self.client, self.profile, self.private_key,
+            f"/profiles/{self.profile.profile_id}/events/read", json={"after_clock": 0},
             headers={"Authorization": f"Bearer {self.sync_token}"},
         )
         self.assertEqual(response.status_code, 200)
@@ -1224,13 +1290,27 @@ class SyncTokenGateTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-    def test_events_open_when_no_sync_token_configured(self) -> None:
+    def test_owner_proof_required_even_when_no_sync_token_configured(self) -> None:
         open_app = create_app(self.db_path)
         open_client = TestClient(open_app)
         open_client.post("/profiles", json={"profile": self.profile.to_document()})
         response = open_client.get(f"/profiles/{self.profile.profile_id}/events")
+        self.assertEqual(response.status_code, 410)
+        response = open_client.post(f"/profiles/{self.profile.profile_id}/events/read", json={"after_clock": 0})
+        self.assertEqual(response.status_code, 401)
+        response = owner_post(open_client, self.profile, self.private_key,
+            f"/profiles/{self.profile.profile_id}/events/read", json={"after_clock": 0})
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(open_client.get("/health").json()["service"]["sync_auth_required"])
+        health = open_client.get("/health").json()["service"]
+        self.assertFalse(health["sync_token_required"])
+        self.assertTrue(health["sync_read_owner_proof_required"])
+
+    def test_shared_token_alone_cannot_read_history(self) -> None:
+        headers = {"Authorization": f"Bearer {self.sync_token}"}
+        response = self.client.post(f"/profiles/{self.profile.profile_id}/events/read",
+            json={"after_clock": 0}, headers=headers)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.client.get(f"/profiles/{self.profile.profile_id}/events", headers=headers).status_code, 410)
 
 
 if __name__ == "__main__":

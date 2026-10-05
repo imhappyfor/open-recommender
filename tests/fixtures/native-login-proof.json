@@ -1,0 +1,12 @@
+{
+  "payload": {
+    "audience": "https://news.example",
+    "expires_at": 1800000120,
+    "issued_at": 1800000000,
+    "nonce": "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio",
+    "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+    "subject": "orf:site:56475aa75463474c0285df5dbf2bcab7",
+    "version": "orf-native-connect-v1"
+  },
+  "signature": "txPd0yG0jBXHBLrLRukLfWMzw1baW3xXMHBjf9tY5mxtebT78OonJtKEXfo4-0S_KL6rpfR9fGeLEU_gR58TDQ"
+}

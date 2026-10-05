@@ -1,0 +1,56 @@
+{
+  "description": "Public test key only; never use it for a real profile. Private seed is bytes(range(32)). These vectors cover the browser challenge subset, not floating-point event payloads.",
+  "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+  "owner_action": {
+    "action": "deny",
+    "target_id": "request-vector",
+    "parameters": {
+      "reason": "No thanks \u2014 merci \ud83d\ude0a"
+    }
+  },
+  "vectors": [
+    {
+      "name": "profile-challenge",
+      "payload": {
+        "challenge_id": "challenge-vector",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "nonce": "000102030405060708090a0b0c0d0e0f",
+        "created_at": "2026-10-01T00:00:00+00:00"
+      },
+      "canonical_utf8_hex": "7b226368616c6c656e67655f6964223a226368616c6c656e67652d766563746f72222c22637265617465645f6174223a22323032362d31302d30315430303a30303a30302b30303a3030222c226e6f6e6365223a223030303130323033303430353036303730383039306130623063306430653066222c2270726f66696c655f6964223a226f72663a70726f66696c653a3536343735616137353436333437346330323835646635646266326263616237227d",
+      "signature": "NkOwauq5yEw5Hqs56jiYPlGzN071WzQz7rp1oglNUDheBwqtk5fHm-O5FkUwPcI7Uro5cuiKwPf1NToas9w6Aw=="
+    },
+    {
+      "name": "owner-denial",
+      "payload": {
+        "challenge_id": "challenge-vector",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "nonce": "000102030405060708090a0b0c0d0e0f",
+        "created_at": "2026-10-01T00:00:00+00:00",
+        "request_id": "request-vector",
+        "challenge_type": "owner-deny:d5ff4af00668641b04929bc21ff109c03bfa8ac50666033d5f38feb1762700c8"
+      },
+      "canonical_utf8_hex": "7b226368616c6c656e67655f6964223a226368616c6c656e67652d766563746f72222c226368616c6c656e67655f74797065223a226f776e65722d64656e793a64356666346166303036363836343162303439323962633231666631303963303362666138616335303636363033336435663338666562313736323730306338222c22637265617465645f6174223a22323032362d31302d30315430303a30303a30302b30303a3030222c226e6f6e6365223a223030303130323033303430353036303730383039306130623063306430653066222c2270726f66696c655f6964223a226f72663a70726f66696c653a3536343735616137353436333437346330323835646635646266326263616237222c22726571756573745f6964223a22726571756573742d766563746f72227d",
+      "signature": "-RECFq5cw3amxcGXCFsLNvKdx684gFW5X69vA7LLNUa7AdNJ4MP1KbW2MlXzmLPphsL1tBCgRHsWpB_nssCPCQ=="
+    },
+    {
+      "name": "unicode-and-ordering",
+      "payload": {
+        "z": "Caf\u00e9 \ud83d\ude0a\u007f\n",
+        "nested": {
+          "2": false,
+          "10": null,
+          "a": "quote\"\\"
+        },
+        "items": [
+          true,
+          0,
+          9007199254740991
+        ]
+      },
+      "canonical_utf8_hex": "7b226974656d73223a5b747275652c302c393030373139393235343734303939315d2c226e6573746564223a7b223130223a6e756c6c2c2232223a66616c73652c2261223a2271756f74655c225c5c227d2c227a223a224361665c7530306539205c75643833645c75646530615c75303037665c6e227d",
+      "signature": "7ZxvnfGQp_b6hMEYZWeu_prVoAvukV6j6uVXsi1Jo67L8X5m67XpxHkQZw4xa2sqLXFmILMbZ5dUhHQlWAbODw=="
+    }
+  ]
+}

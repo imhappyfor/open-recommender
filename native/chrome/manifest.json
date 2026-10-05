@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "ORF Gateway",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "description": "Site-specific ORF login approved in your Mac app. No profile uploads.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7V3WaCm0k9xL9nBTU+We12b5TrgRDVb2V9tIGSnSA7wkGl03Z58PQGfEJgf+qAiZ0CyLvETiF3FIvP9NiJZz2BrHiAfRs7w2LuspAOH2BqHV1Xv97M+ax+a+vR8t372x54gGbiuaUhV2d1IFILLlu3Z4uoie5qdV/VPmlUWR0RwL7UDcCVLLj66R7hj0OZ8SWq79S0aJyermyi+i3CzSlFe9+ebTxHU94bPju9fmE8rImYHPa5zhrAtGYcuU6xqoYC3EUzp59nlhK8bBoHiBd0c5VA8znOzIRlneeG196YUVo9k1KFY12HAF/FD1WfqdfvHKiQdu9j7HSiHpVOJH4QIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{"matches": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
+    "js": ["content.js"], "all_frames": false, "run_at": "document_start"}],
+  "action": {"default_title": "ORF Gateway", "default_popup": "popup.html"}
+}

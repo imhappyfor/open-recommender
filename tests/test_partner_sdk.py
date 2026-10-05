@@ -8,9 +8,11 @@ from urllib.parse import urlsplit
 from fastapi.testclient import TestClient
 
 from open_recommender.crypto import generate_key_pair, sign_payload
-from open_recommender.models import EventOp, ORFProfile, build_signed_event
+from open_recommender.models import EventOp, ORFProfile, build_registration_event, build_signed_event
 from open_recommender.partner_sdk import PartnerClient, PartnerSDKError
 from open_recommender.service import create_app
+from owner_helpers import owner_post
+from open_recommender.cli import signed_owner_payload
 
 
 class PartnerSDKTests(unittest.TestCase):
@@ -21,6 +23,9 @@ class PartnerSDKTests(unittest.TestCase):
         self.client = TestClient(self.app)
         self.private_key, public_key = generate_key_pair()
         self.profile = ORFProfile.create("Alice", public_key, "device-a")
+        registration = build_registration_event(self.profile)
+        registration.signature = sign_payload(registration.unsigned_payload(), self.private_key)
+        self.profile.apply_event(registration)
         event = build_signed_event(
             self.profile,
             EventOp.SET_TOPIC,
@@ -65,7 +70,8 @@ class PartnerSDKTests(unittest.TestCase):
             ["topics.public", "topics.selective:orf:media/podcasts"],
         )
 
-        approval = self.client.post(f"/site-access-requests/{request_id}/approve")
+        approval = owner_post(self.client, self.profile, self.private_key,
+            f"/site-access-requests/{request_id}/approve")
         self.assertEqual(approval.status_code, 200)
 
         exchange = self.partner.exchange_access_request(request_id)
@@ -121,6 +127,15 @@ class PartnerSDKTests(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("not approved", str(context.exception.detail))
 
+    def test_owner_side_sync_read_uses_action_bound_proof(self) -> None:
+        body = signed_owner_payload("http://testserver", self.profile.profile_id, "sync-read",
+            self.profile.profile_id, {"after_clock": 0}, self.private_key, sender=self._send_json)
+        response = self.partner.pull_events(self.profile.profile_id, owner_proof=body["owner_proof"])
+        self.assertEqual(response["events"], [self.profile.event_log[1].to_dict()])
+        with self.assertRaises(PartnerSDKError) as context:
+            self.partner.pull_events(self.profile.profile_id, owner_proof=body["owner_proof"])
+        self.assertEqual(context.exception.status_code, 403)
+
     def test_partner_sdk_rejects_mixed_legacy_and_explicit_scope_fields(self) -> None:
         with self.assertRaises(ValueError):
             self.partner.create_access_request(
@@ -140,7 +155,7 @@ class PartnerSDKTests(unittest.TestCase):
         )
         request_id = created["access_request"]["request_id"]
 
-        approval = self.client.post(
+        approval = owner_post(self.client, self.profile, self.private_key,
             f"/site-access-requests/{request_id}/approve",
             json={"approved_scopes": ["topics.selective:orf:media/podcasts"]},
         )

@@ -1,0 +1,153 @@
+{
+  "description": "Public test key seed bytes(range(32)); never use for real profiles.",
+  "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+  "vectors": [
+    {
+      "name": "registration",
+      "payload": {
+        "event_id": "event-registration",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 0,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "set_profile",
+        "payload": {
+          "display_name": "Vector user",
+          "created_at": "2026-10-01T00:00:00+00:00",
+          "schema_version": "0.2.0"
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":0,\"device_id\":\"vector-device\",\"event_id\":\"event-registration\",\"op\":\"set_profile\",\"payload\":{\"created_at\":\"2026-10-01T00:00:00+00:00\",\"display_name\":\"Vector user\",\"schema_version\":\"0.2.0\"},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "jlefyEPKzv4pyWfeHCYC58Fusjf92c6uIyvDPepkL6xd3Q88JIUH2KKIYcCPCN2sB05u0f_Sm8K8NX6YJ2AnBg=="
+    },
+    {
+      "name": "topic-float",
+      "payload": {
+        "event_id": "event-topic-float",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 1,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "set_topic",
+        "payload": {
+          "topic": "orf:technology/python",
+          "weight": 1.0,
+          "visibility": "private",
+          "label": "Café 😊"
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":1,\"device_id\":\"vector-device\",\"event_id\":\"event-topic-float\",\"op\":\"set_topic\",\"payload\":{\"label\":\"Café 😊\",\"topic\":\"orf:technology/python\",\"visibility\":\"private\",\"weight\":1},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "yyOAe2mcRa5SeXiTrqbXCTOUGy-7ThezJdjJNsaF_tDYPiYb48VrVKuGxZBkBgq5fHtRFRosr_RMJlDTnsOXCw=="
+    },
+    {
+      "name": "recommendation",
+      "payload": {
+        "event_id": "event-recommendation",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 2,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "recommend",
+        "payload": {
+          "item_id": "item-a",
+          "site_id": "site-a",
+          "score": 0.7,
+          "metadata": {
+            "numbers": [
+              1e-07,
+              1e-06,
+              0.002,
+              333333333.3333333,
+              1e+20,
+              1e+23,
+              5e-324,
+              1.7976931348623157e+308,
+              -0.0,
+              9007199254740991
+            ],
+            "10": "ten",
+            "2": "two",
+            "": "BMP",
+            "😊": "astral"
+          }
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":2,\"device_id\":\"vector-device\",\"event_id\":\"event-recommendation\",\"op\":\"recommend\",\"payload\":{\"item_id\":\"item-a\",\"metadata\":{\"10\":\"ten\",\"2\":\"two\",\"numbers\":[1e-7,0.000001,0.002,333333333.3333333,100000000000000000000,1e+23,5e-324,1.7976931348623157e+308,0,9007199254740991],\"😊\":\"astral\",\"\":\"BMP\"},\"score\":0.7,\"site_id\":\"site-a\"},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "R41fKo71uW5dCRjzYdByo13VjwLhUjwSbaMurFPnA3EocTJ2sUpHkHsCZlI8NG0lrAmyRkKlTiJfCEIvEJ8zAA=="
+    },
+    {
+      "name": "consent",
+      "payload": {
+        "event_id": "event-consent",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 3,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "set_consent",
+        "payload": {
+          "field": "ad_personalization",
+          "value": false
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":3,\"device_id\":\"vector-device\",\"event_id\":\"event-consent\",\"op\":\"set_consent\",\"payload\":{\"field\":\"ad_personalization\",\"value\":false},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "fn1x8HcF6dCJslQXBtgMRGZ5ZZvxLpSL7-ynBLABWm0f3JExkDmkqQlefhn3ZF2SYkBpZ8g7RbIhLFRK_tDiCQ=="
+    },
+    {
+      "name": "opt-out",
+      "payload": {
+        "event_id": "event-opt-out",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 4,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "set_opt_out",
+        "payload": {
+          "topic": "orf:media/podcasts",
+          "value": true
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":4,\"device_id\":\"vector-device\",\"event_id\":\"event-opt-out\",\"op\":\"set_opt_out\",\"payload\":{\"topic\":\"orf:media/podcasts\",\"value\":true},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "d-wS-KbW0H2rI3PdqmktP3lPDySf5fp5FVzj1KL-NMpvcv4TZbA1TDUgJ-3o7t_CJvyXxlyPz8C0BxQugkaBDQ=="
+    },
+    {
+      "name": "remove-topic",
+      "payload": {
+        "event_id": "event-remove-topic",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 5,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "remove_topic",
+        "payload": {
+          "topic": "orf:technology/python"
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":5,\"device_id\":\"vector-device\",\"event_id\":\"event-remove-topic\",\"op\":\"remove_topic\",\"payload\":{\"topic\":\"orf:technology/python\"},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "rEdj2wXVSw3tEdqFgWOh_Gwth7yL4T5aLer6AZ-mGhvoJ2uHCU3MJf-jbXqm-UnwHy09QewiCExTnPnhtLfIBQ=="
+    },
+    {
+      "name": "rename",
+      "payload": {
+        "event_id": "event-rename",
+        "profile_id": "orf:profile:56475aa75463474c0285df5dbf2bcab7",
+        "device_id": "vector-device",
+        "clock": 6,
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "op": "set_profile",
+        "payload": {
+          "display_name": "Vector ☕"
+        },
+        "signature_encoding": "jcs-rfc8785"
+      },
+      "canonical_utf8": "{\"clock\":6,\"device_id\":\"vector-device\",\"event_id\":\"event-rename\",\"op\":\"set_profile\",\"payload\":{\"display_name\":\"Vector ☕\"},\"profile_id\":\"orf:profile:56475aa75463474c0285df5dbf2bcab7\",\"signature_encoding\":\"jcs-rfc8785\",\"timestamp\":\"2026-10-01T00:00:00+00:00\"}",
+      "signature": "RGlVU18hSS_-DoITnTUNLnNrEcOMqRCs7Uhrs8CrGzchQgdIawUV-f7DLyDNK-GB4L0iMX37FOxYIPb2Z0yrDg=="
+    }
+  ]
+}

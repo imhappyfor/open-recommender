@@ -1,488 +1,161 @@
 # Getting started
 
-This guide walks through the current local workflow for Open Recommender: install the package, create an ORF profile, edit it through signed events, run the hosted API, and sync with it.
+Create a portable profile, choose a trusted local service, and share only
+specific signals with a site. For the visual demo, follow the
+[README](../README.md#see-the-browser-demo).
 
-If you want a copy-pasteable proof-of-concept walkthrough with representative command output, see [Local proof-of-concept testing](local-poc-testing.md).
+## 1. Install
 
-## Prerequisites
+Use Python 3.10+ from the repository root:
 
-- Python 3.10+
-- a shell with `python` available
-
-## Install
-
-From the repository root:
-
-```bash
+```sh
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install -e '.[dev]'
 ```
 
-## 1. Create a local ORF profile
+On Windows, activate with `.venv\Scripts\activate`. Quoting `'.[dev]'`
+prevents shell wildcard expansion. All commands below assume this environment
+is active.
 
-```bash
-python -m open_recommender.cli create profile.orf --display-name "Alice Example" --device-id laptop
-```
+The current cryptography dependency follows upstream platform support: macOS
+requires Apple Silicon; 32-bit Windows is unsupported. See the
+[upstream compatibility changes](https://cryptography.io/en/latest/changelog/#v49-0-0).
 
-This writes:
+## 2. Create and inspect a profile
 
-- `profile.orf` — the portable JSON profile document
-- `profile.orf.key` — the matching Ed25519 private key in PEM format
-
-The CLI prints JSON including the generated `profile_id`.
-
-## 2. Inspect your profile (Trust verification)
-
-**Your `.orf` file is human-readable JSON.** You can read exactly what's stored by opening it in a text editor:
-
-```bash
-cat profile.orf | jq .
-```
-
-You'll see:
-- `profile_id` — your identity (Ed25519 public key)
-- `display_name`, `device_id` — what you set
-- `topics` — your preferences with visibility levels (`public`, `selective`, `private`)
-- `opt_outs` — topics you've removed
-- `consent` — flags like `hosted_sync`, `ad_personalization`
-- `events` — a signed log of every change (cryptographically verified)
-
-**Why this matters:** You can verify that:
-- No hidden data is stored in your profile
-- Private topics only exist locally (they're not synced or shared)
-- Every change is signed with your key (nobody can modify it without your private key)
-- The CLI isn't secretly collecting extra data
-
-This is the first trust check. If you can read your profile and understand it, you control it.
-
-See [Transparency & Security](transparency-and-security.md) for a complete explanation of what Open Recommender stores and doesn't store.
-
-## 3. Add or remove preference state
-
-Add a public topic:
-
-```bash
+```sh
+python -m open_recommender.cli create profile.orf --display-name "Alice" --device-id laptop
 python -m open_recommender.cli topic-set profile.orf orf:technology/python 0.9
-```
-
-Add a private topic:
-
-```bash
+python -m open_recommender.cli topic-set profile.orf orf:media/podcasts 0.8 --visibility selective
 python -m open_recommender.cli topic-set profile.orf orf:health/sleep 0.4 --visibility private
+python -m open_recommender.cli export-public profile.orf
 ```
 
-Remove a topic:
+Creation writes `profile.orf` (readable JSON) and `profile.orf.key` (the private
+signing key). The profile includes a signed clock-zero registration event.
+Creation refuses existing profile/key destinations; choose new paths rather than
+replacing an identity. CLI saves use protected temporary files, not in-place truncation.
+New files use schema 0.2.0 and JCS signatures; legacy 0.1.0 history is preserved.
+Open the profile in a text editor to inspect its topics, consent, and signed history.
 
-```bash
+- **Public:** may appear in public and approved site projections.
+- **Selective:** appears only for a site granted the exact topic scope.
+- **Private:** never appears in a partner projection; it is still readable in
+  the file and by a service receiving the full profile.
+
+To create synthetic activity instead, add `--seed --seed-value 1234` to
+`create`. The CLI prints the seed and event summary. Never confuse generated
+preferences with a real user's data.
+
+## 3. Change your preferences
+
+```sh
 python -m open_recommender.cli topic-remove profile.orf orf:health/sleep
-```
-
-Update consent:
-
-```bash
-python -m open_recommender.cli consent-set profile.orf hosted_sync false
-python -m open_recommender.cli consent-set profile.orf share_public_topics true
-```
-
-Opt out of a topic from public sharing:
-
-```bash
 python -m open_recommender.cli opt-out-set profile.orf orf:politics/news true
+python -m open_recommender.cli consent-set profile.orf share_public_topics false
 ```
 
-Each of these commands loads the private key, creates a signed event, applies it locally, and saves the updated profile document.
+Each change is signed locally. Removing a topic does not erase its old events.
+Public projections exclude private/selective topics and omit opted-out names.
+`hosted_sync=false` is stored intent, not a block on an explicit upload.
 
-## 2a. Create an encrypted backup for recovery
+## 4. Run and sync with a trusted service
 
-Create a portable backup bundle that includes the profile document plus an encrypted key:
+```sh
+python -m uvicorn open_recommender.service:create_app --factory --host 127.0.0.1
+```
 
-```bash
+Leave it running. In another activated terminal:
+
+```sh
+python -m open_recommender.cli sync-push profile.orf http://127.0.0.1:8000
+python -m open_recommender.cli sync-pull profile.orf http://127.0.0.1:8000
+```
+
+These commands send/read full history, including private topics. The service
+verifies events and merges them; an older upload cannot erase newer events.
+Pulling requires the matching key: the CLI signs a one-time owner read challenge
+and verifies downloaded signatures before saving. Use `--key-path` and
+`--key-passphrase` for a non-default or encrypted key.
+Each pull fetches all post-registration history, so late changes from another
+device are not skipped. It merges without discarding unsent local events;
+download size grows with history. A signature cannot detect service omissions.
+For a legacy file, the first push adds a signed registration event with its
+matching key. Use `--key-path` or `--key-passphrase` when needed, then reopen
+the upgraded file before browser import.
+
+A configured `OPEN_RECOMMENDER_SYNC_TOKEN` gates event routes with one shared
+Bearer token **in addition to owner proof for reads**. CLI push/pull accept
+`--sync-token` or the same environment variable. Prefer the environment to avoid
+putting the token directly in command history. The shared token alone cannot
+read a user's history. See [security boundaries](transparency-and-security.md).
+
+A 413 response means a [service budget](protocol.md#service-budgets) was exceeded;
+your local history stays intact. Ask the operator about capacity rather than
+deleting signed events to make the file fit. For 429, wait the response's
+`Retry-After` interval before retrying.
+
+## 5. Review sharing
+
+Open [Local Profile Lens](http://127.0.0.1:8000/lens) to inspect a local file
+and simulate scopes. Opening it there does not upload it until you choose
+**Register or update in local service**.
+
+Open [Consent inbox](http://127.0.0.1:8000/consent) for pending site requests
+or [Site grants](http://127.0.0.1:8000/consent/grants) to inspect existing grants.
+These surfaces are localhost-only. Choose the matching unencrypted signing key
+to approve, deny, or revoke; only the signature is sent. Use the CLI for encrypted keys.
+
+If a site has given you a request ID:
+
+```sh
+python -m open_recommender.cli site-access-request-get <request_id> http://127.0.0.1:8000
+python -m open_recommender.cli site-access-request-approve <request_id> http://127.0.0.1:8000 \
+  --profile-path profile.orf --scope profile.read --scope topics.public
+```
+
+Or deny it:
+
+```sh
+python -m open_recommender.cli site-access-request-deny <request_id> http://127.0.0.1:8000 \
+  --profile-path profile.orf --reason "Not this time."
+```
+
+Approval includes every required scope and only the optional scopes you select.
+The CLI signs a one-time challenge bound to the exact decision. The site then
+uses a separate user-signed exchange to obtain a short-lived session.
+See the [integration guide](integration-guide.md).
+
+## 6. Revoke access or delete hosted records
+
+```sh
+python -m open_recommender.cli site-grant-revoke <grant_id> http://127.0.0.1:8000 \
+  --profile-path profile.orf
+python -m open_recommender.cli profile-delete profile.orf http://127.0.0.1:8000 --confirm
+```
+
+Revocation blocks new exchanges and further projection, ranking, or feedback
+calls through existing sessions. Deletion atomically removes live profile-linked
+records, including grants, sessions, feedback, and audit events.
+
+Neither operation erases partner copies, operator backups/logs, or local files.
+Your retained signed profile can be registered again.
+
+## 7. Back up and recover
+
+```sh
 python -m open_recommender.cli backup-create profile.orf profile-backup.orfb \
   --backup-passphrase "choose-a-strong-passphrase"
-```
-
-Restore later (or on another device):
-
-```bash
 python -m open_recommender.cli backup-restore profile-backup.orfb restored-profile.orf \
   --backup-passphrase "choose-a-strong-passphrase"
 ```
 
-Current backup guardrails:
-
-- backup creation verifies that the selected key matches the profile public key
-- backup restore verifies key/profile match before writing files
-- restore refuses to overwrite existing files unless `--overwrite` is provided
-
-## 3. Inspect the public projection
-
-```bash
-python -m open_recommender.cli export-public profile.orf
-```
-
-The current public projection includes:
-
-- `profile_id`
-- `display_name`
-- public topics only
-- opted-out topic names
-- a reduced consent view with `share_public_topics` and `ad_personalization`
-- `updated_at`
-
-Private and selective topics remain in the full profile document but are not included in the public projection.
-
-## 4. Run the hosted API
-
-Start the FastAPI app:
-
-```bash
-OPEN_RECOMMENDER_ADMIN_TOKEN=dev-admin-token \
-python -m uvicorn open_recommender.service:create_app --factory --reload
-```
-
-Useful endpoints:
-
-- `GET /health`
-- `POST /profiles`
-- `GET /profiles/{profile_id}/public`
-- `GET /profiles/{profile_id}/events?after_clock=0`
-- `POST /profiles/{profile_id}/events`
-- `POST /profiles/{profile_id}/challenges`
-- `POST /profiles/{profile_id}/challenge-response`
-- `POST /profiles/{profile_id}/site-access-requests`
-- `GET /site-access-requests/{request_id}`
-- `POST /site-access-requests/{request_id}/approve`
-- `POST /site-access-requests/{request_id}/deny`
-- `POST /site-access-requests/{request_id}/exchange`
-- `POST /site-access-requests/{request_id}/verify`
-- `GET /grant-sessions/{session_id}/projection`
-- `POST /grant-sessions/{session_id}/rank`
-- `POST /grant-sessions/{session_id}/rank/feedback`
-- `GET /consent`
-- `GET /consent/grants`
-- `GET /consent/site-access-requests/{request_id}`
-- `GET /consent/site-access-requests/{request_id}/review-data`
-- `POST /consent/grants/{grant_id}/revoke`
-- `POST /consent/site-access-requests/{request_id}/approve`
-- `POST /consent/site-access-requests/{request_id}/deny`
-- `GET /lens`
-- `GET /lens/profiles`
-- `POST /lens/profiles/import`
-- `GET /lens/profiles/{profile_id}`
-- `GET /lens/profiles/{profile_id}/pending-requests`
-- `GET /demo/site/{profile_id}`
-- `POST /demo/site/{profile_id}/challenge`
-- `POST /demo/site/{profile_id}/verify`
-- `GET /admin/pilot-sites`
-- `GET /admin/audit-events`
-
-Generated API docs are also available from the running app at `/docs`.
-
-The service also supports:
-
-- `OPEN_RECOMMENDER_DB_PATH` to override the SQLite path
-- `OPEN_RECOMMENDER_ADMIN_TOKEN` to enable read-only admin inspection routes
-- `OPEN_RECOMMENDER_RATE_LIMIT_WINDOW_SECONDS` and `OPEN_RECOMMENDER_RATE_LIMIT_MAX_REQUESTS` to tune auth-route rate limiting
-- `OPEN_RECOMMENDER_PILOT_SITES_PATH` to load pilot-site registrations from a JSON file
-
-Example:
-
-```bash
-OPEN_RECOMMENDER_PILOT_SITES_PATH=examples/pilot-sites.json \
-python -m uvicorn open_recommender.service:create_app --factory --reload
-```
-
-## 4a. Open the browser trust app
-
-The current browser trust app has two localhost-only entry points:
-
-```text
-http://127.0.0.1:8000/lens
-http://127.0.0.1:8000/consent
-```
-
-Use `/lens` to understand one profile before a live site request exists:
-
-```text
-http://127.0.0.1:8000/lens
-```
-
-From there you can:
-
-- open a local `.orf` file directly in the browser
-- register or update that local file in the running local service with one click
-- or load a profile already registered in the local service
-- inspect what stays on this device
-- inspect what is already public
-- simulate what a site would see under selected scopes
-
-Important boundary:
-
-- opening a local file in `/lens` previews it in the browser
-- the profile is not available to `/profiles/{profile_id}/public` or the React demo until you click **Register or update in local service** or run `python -m open_recommender.cli sync-push profile.orf http://127.0.0.1:8000`
-
-Use `/consent` to review pending live site requests that need a decision:
-
-- see every pending request in one consent inbox
-- jump from a request back to the matching profile lens
-- approve or deny from the browser with grouped scopes that separate already-public data from selective site-only sharing
-
-Use `/consent/grants` to inspect existing grants:
-
-- review active, revoked, and expired grant status
-- revoke active grants from the browser trust app
-- block future session exchange attempts for revoked grants
-
-## 4b. Try the demo flow
-
-The demo endpoints show the current "arrive with a portable profile and get personalized immediately" story.
-
-Preview a site session using only the public profile:
-
-```bash
-curl http://127.0.0.1:8000/demo/site/<profile_id>
-```
-
-Start a proof-of-control challenge:
-
-```bash
-curl -X POST http://127.0.0.1:8000/demo/site/<profile_id>/challenge
-```
-
-The response includes:
-
-- a public-profile-based personalization preview
-- `challenge`
-- `challenge_payload`
-
-Verification is a direct API step: sign `challenge_payload` with the ORF private key and post the signature to `/demo/site/<profile_id>/verify`.
-
-## 4c. Resolve a pilot site access request from the CLI or browser
-
-The site-scoped approval flow uses a CLI reference path and a localhost trust app.
-
-First, the pilot site creates an access request against the hosted service:
-
-```bash
-curl -X POST http://127.0.0.1:8000/profiles/<profile_id>/site-access-requests \
-  -H "Content-Type: application/json" \
-  -d '{
-    "site_id": "open-news-demo",
-    "purpose": "Personalize the pilot site feed.",
-    "requested_scopes": [
-      "profile.read",
-      "topics.public",
-      "topics.selective:orf:media/podcasts"
-    ]
-  }'
-```
-
-Or in Python site code:
-
-```python
-from open_recommender.partner_sdk import PartnerClient
-
-sdk = PartnerClient("http://127.0.0.1:8000")
-created = sdk.create_access_request(
-    profile_id="<profile_id>",
-    site_id="open-news-demo",
-    purpose="Personalize the pilot site feed.",
-    requested_scopes=["profile.read", "topics.public"],
-)
-print(created["access_request"]["request_id"])
-```
-
-Then the ORF user can inspect the request and approve or deny it:
-
-```bash
-python -m open_recommender.cli site-access-request-get <request_id> http://127.0.0.1:8000
-python -m open_recommender.cli site-access-request-approve <request_id> http://127.0.0.1:8000 \
-  --scope profile.read \
-  --scope topics.public \
-  --scope topics.selective:orf:media/podcasts
-python -m open_recommender.cli site-access-request-deny <request_id> http://127.0.0.1:8000 \
-  --reason "User declined this pilot request."
-```
-
-These commands print the service response as JSON so the approved scopes, denial reason, and request status stay explicit.
-
-For a more human-readable review, open the `consent_review_url` returned by the request API in a local browser, or just visit `/consent`. The localhost-only trust app lets the user review pending requests, see a plain-language preview, and approve or deny without the CLI.
-
-If the request is approved, the site starts the grant exchange:
-
-```bash
-curl -X POST http://127.0.0.1:8000/site-access-requests/<request_id>/exchange
-```
-
-The response includes a `challenge` plus `challenge_payload`. Sign `challenge_payload` with the profile's private key, then verify it:
-
-```bash
-curl -X POST http://127.0.0.1:8000/site-access-requests/<request_id>/verify \
-  -H "Content-Type: application/json" \
-  -d '{
-    "challenge_id": "<challenge_id>",
-    "signature": "<ed25519-signature>"
-  }'
-```
-
-Once the service returns a verified `session_id`, you can inspect the consented projection directly:
-
-```bash
-python -m open_recommender.cli grant-session-projection <session_id> http://127.0.0.1:8000
-```
-
-Or rerank site-generated candidates inside that same verified session:
-
-```bash
-curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "0.3.0",
-    "top_n": 2,
-    "include_debug": false,
-    "candidates": [
-      {
-        "candidate_id": "story-123",
-        "site_score": 0.78,
-        "candidate_topics": ["orf:media/podcasts"]
-      }
-    ]
-  }'
-```
-
-The ranking response is intentionally narrow: it returns ranked candidates, scores, and coarse reason
-codes without echoing raw profile topics or topic weights.
-
-If the site wants later reranks under the same grant to incorporate explicit outcomes, it can send
-site-local feedback events:
-
-```bash
-curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank/feedback \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "0.3.0",
-    "events": [
-      {
-        "event_id": "feedback-1",
-        "event_type": "click",
-        "candidate_id": "story-123",
-        "candidate_topics": ["orf:media/podcasts"],
-        "occurred_at": "2025-01-21T10:00:00+00:00"
-      }
-    ]
-  }'
-```
-
-Current feedback types are intentionally narrow: `click`, `dismiss`, and `save`. These traces stay
-in the hosted service, scoped to the site grant, and are reused only for future `/rank` calls tied
-to that grant. `event_id` is the caller-generated dedupe key for safe retries. These traces are not
-written back into the portable ORF document or exposed through projection responses.
-
-Current validation rules for this flow:
-
-- denied or expired requests cannot be exchanged
-- expired or replayed challenges are rejected during verify
-- the projection only includes data covered by the approved scopes
-- public topics still honor `share_public_topics`, approved selective topics are included explicitly, and private topics remain excluded
-- auth-sensitive routes are rate-limited per client
-
-For a tighter adopter-facing walkthrough, see [Pilot integration flow](pilot-integration.md).
-
-If you want a runnable adopter example instead of piecing the flow together from curl commands, run:
-
-```bash
-python examples/pilot_flow.py http://127.0.0.1:8000 profile.orf --auto-approve
-```
-
-That example demonstrates the site-side request/exchange/verify calls and the local ORF signer step in one file.
-
-For a site-shaped validation, you can also run the tiny sample adopter app:
-
-```bash
-SAMPLE_SITE_DEMO_SIGNER_KEY_PATH=profile.orf.key \
-python -m uvicorn examples.sample_site:app --reload --port 9001
-```
-
-Then open `http://127.0.0.1:9001` and start a sample session with a known `profile_id`.
-
-## 5. Sync a profile with the hosted API
-
-Push the full profile and its current event log:
-
-```bash
-python -m open_recommender.cli sync-push profile.orf http://127.0.0.1:8000
-```
-
-Pull events after the local clock:
-
-```bash
-python -m open_recommender.cli sync-pull profile.orf http://127.0.0.1:8000
-```
-
-Current sync behavior is simple:
-
-- `sync-push` posts the full local profile first, then posts the local event log
-- `sync-pull` fetches events after the local clock window and ignores already-known event IDs
-
-### Hosted sync token (paid tier)
-
-When a service is configured with `OPEN_RECOMMENDER_SYNC_TOKEN`, the sync
-push and pull endpoints require a `Bearer` token:
-
-```bash
-# Start the service with a sync token (paid tier mode)
-OPEN_RECOMMENDER_SYNC_TOKEN=my-secret uvicorn open_recommender.service:create_app --factory
-
-# Push with the token
-python -m open_recommender.cli sync-push profile.orf http://127.0.0.1:8000 --sync-token my-secret
-
-# Pull with the token
-python -m open_recommender.cli sync-pull profile.orf http://127.0.0.1:8000 --sync-token my-secret
-```
-
-Without the token, push and pull return `401 Unauthorized`. The health endpoint
-reports `sync_auth_required: true` when the gate is active.
-
-## 5a. Run the pilot dry-run script
-
-`examples/pilot_dry_run.py` is a narrated end-to-end integration script that
-exercises all major flows — profile creation, access request, challenge/verify,
-projection, delta sync push/pull — against a real running service:
-
-```bash
-# Start the service
-uvicorn open_recommender.service:create_app --factory --reload
-
-# Run the dry-run (open tier)
-python examples/pilot_dry_run.py http://127.0.0.1:8000
-
-# Run the dry-run against a token-gated service
-OPEN_RECOMMENDER_SYNC_TOKEN=my-secret uvicorn open_recommender.service:create_app --factory &
-python examples/pilot_dry_run.py http://127.0.0.1:8000 --sync-token my-secret
-```
-
-The script exits `0` on success and prints a summary of what was exercised.
-Use it as a demo script with a pilot partner or as a smoke test before deployment.
-
-## 6. Run tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Current tests cover:
-
-- profile merge and conflict rules
-- signature verification
-- public projection privacy behavior
-- hosted API registration, event ingest, event listing, and challenge-response verification
-- the demo flow for immediate personalization before and after proof-of-control
-- admin audit inspection and auth-route rate limiting
-- hosted sync token gate (open tier vs paid tier, 401 on missing/invalid token)
-- backup create and restore round-trip, key-mismatch rejection
-- partner SDK happy path and error surfacing
-
-## Scope boundaries
-
-- Challenge verification uses Ed25519 signatures over a server-issued challenge payload.
-- There is no browser-native passkey flow.
-- The localhost trust app (`/lens` and `/consent`) only works when the service is bound to localhost.
+Only the recovery key is encrypted; profile JSON and history remain readable.
+Backup creation also refuses an existing destination. Restore checks the key
+matches and refuses to overwrite files without
+`--overwrite`. Protect the backup accordingly. Passphrases supplied on a command
+line may appear in shell history or process listings.
+
+For additional commands, run `python -m open_recommender.cli --help`.
+For contributor tests, see [Contributing](../CONTRIBUTING.md).

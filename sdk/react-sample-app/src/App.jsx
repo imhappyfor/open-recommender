@@ -52,6 +52,13 @@ function buildDemoRankingCandidates() {
   }));
 }
 
+function wrapError(err) {
+  if (err instanceof ORFClientError) {
+    return `${err.message}${err.status ? ` (HTTP ${err.status})` : ""}${err.detail ? ` – ${JSON.stringify(err.detail)}` : ""}`;
+  }
+  return String(err);
+}
+
 function browserSigninErrorMessage(err) {
   const wrapped = wrapError(err);
   if (err instanceof ORFClientError && err.status === 400 && err.detail === "Signature verification failed.") {
@@ -182,7 +189,7 @@ function StatusBadge({ status }) {
 function ErrorBanner({ error }) {
   if (!error) return null;
   return (
-    <div className="banner banner-error">
+    <div className="banner banner-error" role="alert">
       <strong>Error:</strong> {error}
     </div>
   );
@@ -269,7 +276,7 @@ function RequestCard({
         <div className="banner banner-info" style={{ marginTop: 14 }}>
           <p style={{ margin: "0 0 8px" }}>
             {hasInlineConsent
-              ? "Approve or deny below in this tab. The separate localhost review page is optional and not needed for the normal browser flow."
+              ? "Load the matching .orf.key, then approve or deny below. Your decision is signed in this tab."
               : "The request is waiting for the user to approve it in the ORF trust app."}
           </p>
           {hasInlineConsent && hasSigningKey && (
@@ -464,13 +471,6 @@ export default function App() {
     return clientRef.current;
   }
 
-  function wrapError(err) {
-    if (err instanceof ORFClientError) {
-      return `${err.message}${err.status ? ` (HTTP ${err.status})` : ""}${err.detail ? ` – ${JSON.stringify(err.detail)}` : ""}`;
-    }
-    return String(err);
-  }
-
   const loadConsentReview = useCallback(async (requestId) => {
     const review = await getClient().getConsentReview(requestId);
     setConsentReview(review);
@@ -516,7 +516,7 @@ export default function App() {
     try {
       const text = await file.text();
       const profileDocument = JSON.parse(text);
-      const result = await getClient().upsertProfile(profileDocument);
+      const result = await getClient().upsertProfile(text);
       const importedProfileId = result.profile_id ?? result.public_profile?.profile_id ?? profileDocument.profile_id;
       setProfileId(importedProfileId);
       setImportStatus(`Imported ${file.name} and registered ${importedProfileId} in the ORF service.`);
@@ -602,6 +602,21 @@ export default function App() {
     }
   }, [requestData, serviceUrl, applyRequestState]);
 
+  const makeConsentProof = useCallback(async (action, parameters) => {
+    if (!signingKey) throw new Error("Upload the matching .orf.key before approving or denying consent.");
+    const requestId = requestData.access_request?.request_id ?? requestData.request_id;
+    const { challenge_payload: challenge } = await getClient().createOwnerActionChallenge({
+      profileId: requestData.profile_id ?? profileId,
+      action,
+      targetId: requestId,
+      parameters,
+    });
+    return {
+      challenge_id: challenge.challenge_id,
+      signature: await signChallengePayloadInBrowser(challenge, signingKey),
+    };
+  }, [requestData, profileId, signingKey, serviceUrl]);
+
   const handleApproveConsent = useCallback(async () => {
     if (!requestData || !consentReview) return;
     setError(null);
@@ -612,6 +627,7 @@ export default function App() {
         requestId,
         approvedScopes: selectedScopes,
         csrfToken: consentReview.csrf_token,
+        ownerProof: await makeConsentProof("approve", { approved_scopes: selectedScopes }),
       });
       await applyRequestState({ ...requestData, ...result, access_request: result.access_request });
     } catch (err) {
@@ -619,7 +635,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [requestData, consentReview, selectedScopes, serviceUrl, applyRequestState]);
+  }, [requestData, consentReview, selectedScopes, serviceUrl, applyRequestState, makeConsentProof]);
 
   const handleDenyConsent = useCallback(async () => {
     if (!requestData || !consentReview) return;
@@ -631,6 +647,7 @@ export default function App() {
         requestId,
         reason: denyReason.trim() || undefined,
         csrfToken: consentReview.csrf_token,
+        ownerProof: await makeConsentProof("deny", denyReason.trim() ? { reason: denyReason.trim() } : {}),
       });
       await applyRequestState({ ...requestData, ...result, access_request: result.access_request });
     } catch (err) {
@@ -638,7 +655,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [requestData, consentReview, denyReason, serviceUrl, applyRequestState]);
+  }, [requestData, consentReview, denyReason, serviceUrl, applyRequestState, makeConsentProof]);
 
   const completeBrowserSignIn = useCallback(async (exchangeOverride = null) => {
     const activeExchange = exchangeOverride ?? requestData?._exchange;
@@ -739,18 +756,36 @@ export default function App() {
 
   return (
     <main>
-      <h1>Open Recommender – React SDK demo</h1>
-      <p className="lead">
-        Demonstrates the <code>@open-recommender/orf-web-sdk</code> browser SDK against a locally
-        running ORF service. Import a local profile or enter a registered profile ID to start the
-        access-request flow.
-      </p>
+      <header className="demo-header">
+        <a className="brand" href="#">OR<span>F</span> <span className="brand-name">Open Recommender</span></a>
+        <span className="preview-label">Local developer preview</span>
+      </header>
+      <section className="hero" aria-labelledby="demo-title">
+        <p className="eyebrow">Portable preferences. Personal recommendations.</p>
+        <h1 id="demo-title">Your taste.<br /><span>Your terms.</span></h1>
+        <p className="lead">Bring a profile, choose what this site can see, and watch a feed
+          adapt. Your preferences travel with you — not with a platform.</p>
+        <div className="hero-note">No site account in this demo. Every sharing decision is signed.</div>
+      </section>
+      <ol className="journey" aria-label="Demo steps">
+        {["Bring your profile", "Choose your sharing", "Personalize the feed"].map((label, index) => {
+          const activeStep = projection ? 2 : requestData ? 1 : 0;
+          return <li key={label} className={index <= activeStep ? "step-active" : ""}
+            aria-current={index === activeStep ? "step" : undefined}>
+            <span className="step-number">{index + 1}</span>{label}</li>;
+        })}
+      </ol>
+      <aside className="demo-boundary">
+        <strong>Local demo, real trust boundary.</strong> Choosing a profile uploads its full history,
+        including private topics, to the local service. The key stays in this tab's memory.
+        Never give a private key to a real partner site.
+      </aside>
 
       <ErrorBanner error={error} />
 
       <div className="grid">
         <div className="card">
-          <h2>Service connection</h2>
+          <h2>01 / Bring your profile</h2>
           <label>
             ORF service URL
             <input
@@ -772,7 +807,7 @@ export default function App() {
             />
           </label>
           {importStatus && (
-            <p id="profile-import-status" className="muted" style={{ marginTop: 8 }}>
+            <p id="profile-import-status" className="muted" role="status" style={{ marginTop: 8 }}>
               {importStatus}
             </p>
           )}
@@ -787,7 +822,7 @@ export default function App() {
             />
           </label>
           {signingKeyStatus && (
-            <p id="key-import-status" className="muted" style={{ marginTop: 8 }}>
+            <p id="key-import-status" className="muted" role="status" style={{ marginTop: 8 }}>
               {signingKeyStatus}
             </p>
           )}
@@ -815,7 +850,7 @@ export default function App() {
         </div>
 
         <div className="card">
-          <h2>Requested scopes</h2>
+          <h2>02 / This site's request</h2>
           <p className="muted">
             Site ID: <code>{DEFAULT_SITE_ID}</code>
           </p>

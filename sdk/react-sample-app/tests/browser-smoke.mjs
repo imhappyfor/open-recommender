@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
-import { writeFile, rm } from "node:fs/promises";
+import { createHash, generateKeyPairSync, verify } from "node:crypto";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 import puppeteer from "puppeteer";
+import { createServer as createViteServer } from "vite";
+import { canonicalJsonBytes } from "../../orf-web-sdk/src/index.js";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const APP_DIR = resolve(TEST_DIR, "..");
@@ -58,9 +60,10 @@ async function readJson(req) {
   return JSON.parse(text);
 }
 
-function createMockOrfApi() {
+function createMockOrfApi(publicKey) {
   const requests = new Map();
   const sessions = new Map();
+  const ownerChallenges = new Map();
   let nextId = 1;
   let nextSessionId = 1;
 
@@ -84,8 +87,24 @@ function createMockOrfApi() {
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/profiles") {
+    if (req.method === "POST" && url.pathname.endsWith("/owner-action-challenges")) {
       const body = await readJson(req);
+      const digest = createHash("sha256").update(canonicalJsonBytes(body)).digest("hex");
+      const challenge = {
+        challenge_id: `owner-${nextId++}`, profile_id: "orf:profile:demo", nonce: "owner-nonce",
+        created_at: "2026-05-23T00:00:00Z", challenge_type: `owner-${body.action}:${digest}`,
+      };
+      ownerChallenges.set(challenge.challenge_id, { challenge, body });
+      jsonResponse(res, 200, { challenge_payload: challenge }, origin);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/profiles") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const raw = Buffer.concat(chunks).toString("utf-8");
+      assert.match(raw, /"weight":1\.0/, "Browser imports must preserve original signed JSON numbers");
+      const body = JSON.parse(raw);
       const profile = body.profile ?? {};
       jsonResponse(res, 200, {
         profile_id: profile.profile_id,
@@ -202,6 +221,15 @@ function createMockOrfApi() {
         return;
       }
       const body = await readJson(req);
+      const owner = ownerChallenges.get(body.owner_proof?.challenge_id);
+      const { owner_proof: proof, ...parameters } = body;
+      if (!owner || owner.body.action !== "approve" || owner.body.target_id !== requestId
+          || JSON.stringify(owner.body.parameters) !== JSON.stringify(parameters)
+          || !verify(null, canonicalJsonBytes(owner.challenge), publicKey, Buffer.from(proof.signature, "base64url"))) {
+        jsonResponse(res, 403, { detail: "Invalid owner proof" }, origin);
+        return;
+      }
+      ownerChallenges.delete(proof.challenge_id);
       record.approved = true;
       record.access_request.status = "approved";
       record.access_request.approved_scopes = body.approved_scopes ?? [];
@@ -260,6 +288,12 @@ function createMockOrfApi() {
         jsonResponse(res, 400, { detail: "Request is not approved yet." }, origin);
         return;
       }
+      const challenge = {
+        challenge_id: `exchange-${nextId++}`, profile_id: record.profile_id,
+        nonce: "abc123", created_at: "2026-05-23T00:00:00Z", request_id: requestId,
+        site_id: "open-news-demo", grant_id: "grant-1", challenge_type: "grant-exchange",
+      };
+      record.exchangeChallenge = challenge;
       jsonResponse(res, 200, {
         access_request: record.access_request,
         grant: {
@@ -267,16 +301,8 @@ function createMockOrfApi() {
           request_id: requestId,
           approved_scopes: record.access_request.requested_scopes,
         },
-        challenge: {
-          challenge_id: "challenge-1",
-          profile_id: record.profile_id,
-        },
-        challenge_payload: {
-          challenge_id: "challenge-1",
-          profile_id: record.profile_id,
-          nonce: "abc123",
-          created_at: "2026-05-23T00:00:00Z",
-        },
+        challenge,
+        challenge_payload: challenge,
       }, origin);
       return;
     }
@@ -288,6 +314,14 @@ function createMockOrfApi() {
         jsonResponse(res, 404, { detail: "Request not found." }, origin);
         return;
       }
+      const body = await readJson(req);
+      const challenge = record.exchangeChallenge;
+      if (!challenge || body.challenge_id !== challenge.challenge_id ||
+          !verify(null, canonicalJsonBytes(challenge), publicKey, Buffer.from(body.signature, "base64url"))) {
+        jsonResponse(res, 400, { detail: "Signature verification failed." }, origin);
+        return;
+      }
+      record.exchangeChallenge = null;
       const sessionId = `session-${nextSessionId++}`;
       sessions.set(sessionId, {
         requestId,
@@ -388,20 +422,28 @@ function startPreviewServer() {
 }
 
 async function main() {
-  const build = spawnProcess("npm", ["run", "build"], { cwd: APP_DIR, env: { ...process.env, CI: "1" } });
+  await checkPrivateFileBoundary();
+  const build = spawnProcess("npm", ["run", "build"], {
+    cwd: APP_DIR, env: { ...process.env, CI: "1", NODE_ENV: "production" },
+  });
   const buildExit = await onceExit(build);
   if (buildExit !== 0) {
     throw new Error("Vite build failed.");
   }
 
-  const mock = createMockOrfApi();
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const mock = createMockOrfApi(publicKey);
   const preview = startPreviewServer();
-  const browser = await puppeteer.launch({ headless: "new", args: ["--no-sandbox"] });
+  const browser = await puppeteer.launch({
+    headless: "shell", args: ["--no-sandbox"],
+    defaultViewport: { width: 1280, height: 900 }, protocolTimeout: 15000,
+  });
   const tempProfilePath = resolve(tmpdir(), `orf-react-sample-${Date.now()}.orf`);
   const tempKeyPath = resolve(tmpdir(), `orf-react-sample-${Date.now()}.orf.key`);
+  const wrongKeyPath = resolve(tmpdir(), `orf-react-wrong-${Date.now()}.orf.key`);
+  let page;
 
   try {
-    const { privateKey } = generateKeyPairSync("ed25519");
     await writeFile(
       tempProfilePath,
       JSON.stringify({
@@ -414,7 +456,7 @@ async function main() {
           ad_personalization: true,
           hosted_sync: false,
         },
-      }),
+      }).replace('"topics":[]', '"topics":[{"topic":"orf:technology/python","weight":1.0}]'),
       "utf-8",
     );
     await writeFile(
@@ -422,6 +464,7 @@ async function main() {
       privateKey.export({ type: "pkcs8", format: "pem" }),
       "utf-8",
     );
+    await writeFile(wrongKeyPath, generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }), "utf-8");
 
     await new Promise((resolve, reject) => {
       mock.server.listen(MOCK_API_PORT, "127.0.0.1", resolve);
@@ -430,11 +473,12 @@ async function main() {
     await waitForHttp(`${SERVICE_URL}/health`);
     await waitForHttp(APP_URL);
 
-    const page = await browser.newPage();
+    page = await browser.newPage();
     const consoleErrors = [];
     page.on("pageerror", (error) => consoleErrors.push(error.message));
 
     await page.goto(APP_URL, { waitUntil: "networkidle2" });
+    assert.match(await page.$eval("h1", (node) => node.textContent), /Your taste.*Your terms/);
     await page.locator("#service-url").fill(SERVICE_URL);
     const uploadInput = await page.waitForSelector("#profile-file-upload");
     await uploadInput.uploadFile(tempProfilePath);
@@ -473,7 +517,13 @@ async function main() {
       () => document.querySelector("#request-status-badge")?.textContent === "approved",
     );
 
+    await keyUploadInput.uploadFile(wrongKeyPath);
+    await page.waitForFunction((name) => document.querySelector("#key-import-status")?.textContent?.includes(name), {}, basename(wrongKeyPath));
     await page.locator("#start-exchange").click();
+    await page.waitForFunction(() => document.querySelector(".banner-error")?.textContent?.includes("does not match this profile"));
+    await keyUploadInput.uploadFile(tempKeyPath);
+    await page.waitForFunction((name) => document.querySelector("#key-import-status")?.textContent?.includes(name), {}, basename(tempKeyPath));
+    await page.locator("#complete-browser-signin").click();
     await page.waitForSelector("#projection-card");
     await page.waitForSelector("#ranking-card");
     assert.match(
@@ -493,13 +543,60 @@ async function main() {
     );
 
     assert.deepEqual(consoleErrors, []);
+    await page.screenshot({ path: resolve(tmpdir(), "orf-demo-desktop.png"), fullPage: true });
+    await page.setViewport({ width: 390, height: 844 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, "Mobile view must not overflow horizontally");
+    await page.screenshot({ path: resolve(tmpdir(), "orf-demo-mobile.png"), fullPage: true });
     await page.close();
+  } catch (error) {
+    console.error("Browser test failed:", error);
+    if (page && !page.isClosed()) {
+      try {
+        console.error("Browser failure state:", await page.evaluate(() => ({
+          url: location.href,
+          error: document.querySelector(".banner-error")?.textContent,
+          profileId: document.querySelector("#profile-id")?.value,
+          importStatus: document.querySelector("#profile-import-status")?.textContent,
+          keyStatus: document.querySelector("#key-import-status")?.textContent,
+        })));
+        await page.screenshot({ path: resolve(tmpdir(), "orf-demo-failure.png"), fullPage: true });
+      } catch (diagnosticError) {
+        console.error("Could not capture browser diagnostics:", diagnosticError.message);
+      }
+    }
+    throw error;
   } finally {
     await browser.close();
     mock.server.close();
     preview.kill("SIGTERM");
     await rm(tempProfilePath, { force: true });
     await rm(tempKeyPath, { force: true });
+    await rm(wrongKeyPath, { force: true });
+  }
+}
+
+async function checkPrivateFileBoundary() {
+  const fixtureDir = await mkdtemp(resolve(APP_DIR, ".orf-security-test-"));
+  let server;
+  try {
+    server = await createViteServer({ server: { port: 0 }, logLevel: "silent" });
+    assert.equal(Boolean(server.config.publicDir), false, "No unfiltered public-file directory");
+    await server.listen();
+    const address = server.httpServer.address();
+    const base = `http://${address.family === "IPv6" ? "[::1]" : address.address}:${address.port}`;
+    assert.equal((await fetch(base)).status, 200, "Development app must still load");
+    for (const name of ["profile.orf", "profile.orf.key", "backup.orfb", ".orf-save-synthetic.orf", ".env", "key.pem"]) {
+      const path = resolve(fixtureDir, name);
+      await writeFile(path, "synthetic-private-file-marker");
+      for (const route of [`/${basename(fixtureDir)}/${name}`, `/@fs/${path}?raw`]) {
+        const response = await fetch(`${base}${route}`);
+        assert.equal(response.status, 403, `Development server must deny ${name}`);
+        assert.ok(!(await response.text()).includes("synthetic-private-file-marker"));
+      }
+    }
+  } finally {
+    await server?.close();
+    await rm(fixtureDir, { recursive: true, force: true });
   }
 }
 

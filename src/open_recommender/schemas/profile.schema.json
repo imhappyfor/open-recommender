@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ORF 0.1/0.2 profile structure",
+  "description": "Structural contract, not proof of identity, valid signatures, consent, or replay integrity. See docs/protocol.md. Unknown fields are allowed but need not survive model round-trips.",
+  "type": "object",
+  "required": ["schema_version", "profile_id", "display_name", "public_key", "created_at", "updated_at"],
+  "properties": {
+    "schema_version": {"type": "string", "description": "Reference model checks supported major-zero versions separately."},
+    "profile_id": {"type": "string"},
+    "display_name": {"type": "string"},
+    "public_key": {"type": "string", "description": "Base64url raw Ed25519 public key; decode and fingerprint separately."},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "topics": {"type": "array", "items": {"$ref": "#/$defs/topicPreference"}},
+    "opt_out_topics": {"type": "array", "items": {"$ref": "#/$defs/topic"}},
+    "consent": {
+      "type": "object",
+      "description": "Omitted reference-model flags default to true. These are not site grants; verify signed history and scopes separately.",
+      "properties": {
+        "share_public_topics": {"type": "boolean"},
+        "ad_personalization": {"type": "boolean"},
+        "hosted_sync": {"type": "boolean"}
+      }
+    },
+    "sync": {
+      "type": "object",
+      "required": ["device_id"],
+      "properties": {
+        "device_id": {"type": "string"},
+        "last_clock": {"$ref": "#/$defs/clock"},
+        "topic_clocks": {"$ref": "#/$defs/clockMap"},
+        "consent_clocks": {"$ref": "#/$defs/clockMap"},
+        "opt_out_clocks": {"$ref": "#/$defs/clockMap"}
+      }
+    },
+    "event_log": {"type": "array", "items": {"$ref": "#/$defs/signedEvent"}}
+  },
+  "$defs": {
+    "nonemptyString": {"type": "string", "minLength": 1},
+    "topic": {"type": "string", "description": "Validate namespaced lowercase/digit/hyphen segments separately; ASCII is the portable baseline."},
+    "timestamp": {"type": "string", "minLength": 1, "description": "Validate timezone-aware ISO 8601 and UTC representability separately, not RFC 3339 format alone."},
+    "clock": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Reference parser additionally requires an integer JSON token, not 1.0 or 1e0."},
+    "clockMap": {"type": "object", "additionalProperties": {"$ref": "#/$defs/clock"}},
+    "weight": {"type": "number", "minimum": 0, "maximum": 1},
+    "visibility": {"enum": ["public", "selective", "private"]},
+    "topicPreference": {
+      "type": "object",
+      "required": ["topic", "weight", "visibility", "updated_at"],
+      "properties": {
+        "topic": {"$ref": "#/$defs/topic"},
+        "weight": {"$ref": "#/$defs/weight"},
+        "visibility": {"$ref": "#/$defs/visibility"},
+        "updated_at": {"type": "string"}
+      }
+    },
+    "signedEvent": {
+      "$anchor": "signedEvent",
+      "type": "object",
+      "required": ["event_id", "profile_id", "device_id", "clock", "timestamp", "op", "payload", "signature"],
+      "properties": {
+        "event_id": {"$ref": "#/$defs/nonemptyString"},
+        "profile_id": {"$ref": "#/$defs/nonemptyString"},
+        "device_id": {"$ref": "#/$defs/nonemptyString"},
+        "clock": {"$ref": "#/$defs/clock"},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "op": {"enum": ["set_topic", "remove_topic", "set_consent", "set_opt_out", "set_profile", "recommend"]},
+        "payload": {"type": "object"},
+        "signature": {"type": "string", "description": "Base64url Ed25519 signature; verification is mandatory and separate."},
+        "signature_encoding": {"const": "jcs-rfc8785", "description": "Signed encoding selector; omitted only for legacy Python-JSON events."}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"op": {"const": "set_topic"}}},
+          "then": {"properties": {"payload": {
+            "required": ["topic", "weight", "visibility"],
+            "properties": {"topic": {"$ref": "#/$defs/topic"}, "weight": {"$ref": "#/$defs/weight"}, "visibility": {"$ref": "#/$defs/visibility"}}
+          }}}
+        },
+        {
+          "if": {"properties": {"op": {"enum": ["remove_topic", "set_opt_out"]}}},
+          "then": {"properties": {"payload": {"required": ["topic"], "properties": {"topic": {"$ref": "#/$defs/topic"}}}}}
+        },
+        {
+          "if": {"properties": {"op": {"enum": ["set_consent", "set_opt_out"]}}},
+          "then": {"properties": {"payload": {"required": ["value"], "properties": {"value": {"type": "boolean"}}}}}
+        },
+        {
+          "if": {"properties": {"op": {"const": "set_consent"}}},
+          "then": {"properties": {"payload": {
+            "required": ["field"],
+            "properties": {"field": {"enum": ["share_public_topics", "ad_personalization", "hosted_sync"]}}
+          }}}
+        },
+        {
+          "if": {"properties": {"op": {"const": "set_profile"}}},
+          "then": {"properties": {"payload": {"required": ["display_name"], "properties": {"display_name": {"type": "string"}}}}}
+        },
+        {
+          "if": {"properties": {"op": {"const": "set_profile"}, "clock": {"const": 0}}},
+          "then": {"properties": {"payload": {
+            "required": ["created_at", "schema_version"],
+            "properties": {"created_at": {"$ref": "#/$defs/timestamp"}, "schema_version": {"type": "string"}}
+          }}}
+        },
+        {
+          "if": {"properties": {"op": {"const": "recommend"}}},
+          "then": {"properties": {"payload": {
+            "required": ["item_id", "site_id"],
+            "properties": {
+              "item_id": {"$ref": "#/$defs/nonemptyString"},
+              "site_id": {"$ref": "#/$defs/nonemptyString"},
+              "score": {"$ref": "#/$defs/weight"},
+              "metadata": {"type": "object"},
+              "timestamp": {"$ref": "#/$defs/timestamp"}
+            }
+          }}}
+        }
+      ]
+    }
+  }
+}

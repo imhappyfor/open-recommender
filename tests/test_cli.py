@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from base64 import b64encode
@@ -16,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from open_recommender import cli
 from open_recommender.crypto import generate_key_pair, private_key_public_key_b64, save_private_key, sign_payload
-from open_recommender.models import EventOp, ORFProfile, build_signed_event
+from open_recommender.models import EventOp, ORFProfile, build_registration_event, build_signed_event
 from open_recommender.service import create_app
 
 
@@ -34,6 +35,9 @@ class CliTests(unittest.TestCase):
         self.client = TestClient(self.app)
         self.private_key, public_key = generate_key_pair()
         self.profile = ORFProfile.create("Alice", public_key, "device-a")
+        registration = build_registration_event(self.profile)
+        registration.signature = sign_payload(registration.unsigned_payload(), self.private_key)
+        self.profile.apply_event(registration)
         self._signed_event(
             EventOp.SET_TOPIC,
             {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
@@ -44,6 +48,9 @@ class CliTests(unittest.TestCase):
         )
         self.client.post("/profiles", json={"profile": self.profile.to_document()})
         self.server = "http://testserver"
+        self.profile_path = Path(self.temp_dir.name) / "owner.orf"
+        cli.save_profile(self.profile_path, self.profile)
+        save_private_key(self.profile_path.with_suffix(".orf.key"), self.private_key)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -54,12 +61,12 @@ class CliTests(unittest.TestCase):
         self.profile.apply_event(event)
         return event.to_dict()
 
-    def _send_json(self, method: str, url: str, body: dict | None = None) -> dict:
+    def _send_json(self, method: str, url: str, body: dict | None = None, *, extra_headers=None) -> dict:
         parsed = urlsplit(url)
         path = parsed.path
         if parsed.query:
             path = f"{path}?{parsed.query}"
-        response = self.client.request(method, path, json=body)
+        response = self.client.request(method, path, json=body, headers=extra_headers)
         self.assertLess(response.status_code, 400, response.text)
         return response.json()
 
@@ -68,7 +75,7 @@ class CliTests(unittest.TestCase):
         with patch("open_recommender.cli.send_json", side_effect=self._send_json):
             with redirect_stdout(stdout):
                 exit_code = cli.main(list(argv))
-        return exit_code, json.loads(stdout.getvalue())
+        return exit_code, json.loads(stdout.getvalue() or "{}")
 
     def _run_local_cli(self, *argv: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -76,6 +83,31 @@ class CliTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = cli.main(list(argv))
         return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def test_public_export_omits_opt_out_names_without_modifying_owner_file(self) -> None:
+        topic = "orf:health/private-condition"
+        self._signed_event(EventOp.SET_OPT_OUT, {"topic": topic, "value": True})
+        cli.save_profile(self.profile_path, self.profile)
+        original = self.profile_path.read_bytes()
+        code, stdout, _ = self._run_local_cli("export-public", str(self.profile_path))
+        self.assertEqual(code, 0)
+        self.assertNotIn("opt_out_topics", json.loads(stdout))
+        self.assertNotIn(topic, stdout)
+        self.assertEqual(self.profile_path.read_bytes(), original)
+        self.assertIn(topic, cli.load_profile(self.profile_path).opt_out_topics)
+
+    def test_create_refuses_existing_identity_and_colliding_destinations(self) -> None:
+        key_path = self.profile_path.with_suffix(".orf.key")
+        before = [path.read_bytes() for path in (self.profile_path, key_path)]
+        code, _, stderr = self._run_local_cli("create", str(self.profile_path), "--display-name", "Replacement")
+        self.assertEqual(code, 1)
+        self.assertIn("Refusing to overwrite", stderr)
+        self.assertEqual([path.read_bytes() for path in (self.profile_path, key_path)], before)
+        fresh = Path(self.temp_dir.name) / "fresh.orf"
+        code, _, stderr = self._run_local_cli("create", str(fresh), "--key-path", str(fresh), "--display-name", "Fresh")
+        self.assertEqual(code, 1)
+        self.assertIn("different files", stderr)
+        self.assertFalse(fresh.exists())
 
     def test_cli_can_inspect_approve_and_fetch_projection(self) -> None:
         request_response = self.client.post(
@@ -106,6 +138,7 @@ class CliTests(unittest.TestCase):
             "site-access-request-approve",
             request_id,
             self.server,
+            "--profile-path", str(self.profile_path),
             "--scope",
             "profile.read",
             "--scope",
@@ -167,6 +200,7 @@ class CliTests(unittest.TestCase):
             "site-access-request-deny",
             request_id,
             self.server,
+            "--profile-path", str(self.profile_path),
             "--reason",
             "User declined this pilot request.",
         )
@@ -178,6 +212,110 @@ class CliTests(unittest.TestCase):
         )
         exchange_response = self.client.post(f"/site-access-requests/{request_id}/exchange")
         self.assertEqual(exchange_response.status_code, 400)
+
+    def test_cli_sync_pull_signs_owner_proof_and_supports_encrypted_keys_and_token(self) -> None:
+        remote = self._signed_event(EventOp.SET_TOPIC,
+            {"topic": "orf:health/sleep", "weight": 0.6, "visibility": "private"})
+        self.app.state.store.append_events(self.profile.profile_id, [cli.build_event_from_remote(remote)])
+        self.client = TestClient(create_app(self.app.state.config.db_path, sync_token="test-token"))
+        save_private_key(self.profile_path.with_suffix(".orf.key"), self.private_key, "key-passphrase")
+        with patch("open_recommender.cli.send_json", side_effect=self._send_json), \
+                patch.dict("os.environ", {"OPEN_RECOMMENDER_SYNC_TOKEN": "test-token"}):
+            code, _, stderr = self._run_local_cli("sync-pull", str(self.profile_path), self.server,
+                "--key-passphrase", "key-passphrase")
+        self.assertEqual(code, 0, stderr)
+        saved = cli.load_profile(self.profile_path)
+        self.assertEqual(saved.topics["orf:health/sleep"].visibility.value, "private")
+        self.assertEqual(saved.event_log[-1].to_dict(), remote)
+
+    def test_cli_sync_pull_rejects_forged_batch_without_changing_local_file(self) -> None:
+        remotes = [self._signed_event(EventOp.SET_TOPIC,
+            {"topic": topic, "weight": 0.6, "visibility": "private"})
+            for topic in ("orf:health/sleep", "orf:health/exercise")]
+        self.app.state.store.append_events(self.profile.profile_id,
+            [cli.build_event_from_remote(event) for event in remotes])
+        original = self.profile_path.read_bytes()
+
+        def forged_sender(method, url, body=None, **kwargs):
+            response = self._send_json(method, url, body, **kwargs)
+            if url.endswith("/events/read"):
+                response["events"][-1]["payload"]["weight"] = 0.1
+            return response
+
+        with patch("open_recommender.cli.send_json", side_effect=forged_sender):
+            code, _, stderr = self._run_local_cli("sync-pull", str(self.profile_path), self.server)
+        self.assertEqual(code, 1)
+        self.assertIn("Signature verification failed", stderr)
+        self.assertEqual(self.profile_path.read_bytes(), original)
+
+    def test_cli_sync_pull_keeps_late_events_and_replays_ties_without_losing_local_changes(self) -> None:
+        local = cli.load_profile(self.profile_path)
+        local.sync.device_id = "offline-laptop"
+
+        def signed(op, payload, clock, timestamp):
+            event = build_signed_event(local, op, payload, signature="", clock=clock, timestamp=timestamp)
+            event.signature = sign_payload(event.unsigned_payload(), self.private_key)
+            return event
+
+        local_events = [
+            signed(EventOp.SET_TOPIC, {"topic": "orf:technology/python", "weight": 0.9,
+                "visibility": "public"}, 10, "2026-01-02T00:00:00+00:00"),
+            signed(EventOp.SET_CONSENT, {"field": "ad_personalization", "value": True},
+                10, "2026-01-02T00:00:00+00:00"),
+            signed(EventOp.SET_TOPIC, {"topic": "orf:health/exercise", "weight": 0.6,
+                "visibility": "private"}, 20, "2026-01-03T00:00:00+00:00"),
+        ]
+        for event in local_events:
+            local.apply_event(event)
+        cli.save_profile(self.profile_path, local)
+        remote_events = [
+            signed(EventOp.SET_TOPIC, {"topic": "orf:health/sleep", "weight": 0.5,
+                "visibility": "private"}, 1, "2026-01-01T00:00:00+00:00"),
+            signed(EventOp.SET_TOPIC, {"topic": "orf:technology/python", "weight": 0.2,
+                "visibility": "public"}, 10, "2026-01-01T00:00:00+00:00"),
+            signed(EventOp.SET_CONSENT, {"field": "ad_personalization", "value": False},
+                10, "2026-01-01T00:00:00+00:00"),
+        ]
+        self.app.state.store.append_events(local.profile_id, remote_events)
+        self.assertEqual(self._run_cli("sync-pull", str(self.profile_path), self.server)[0], 0)
+        saved = cli.load_profile(self.profile_path)
+        self.assertEqual(saved.topics["orf:technology/python"].weight, 0.9)
+        self.assertIn("orf:health/sleep", saved.topics)
+        self.assertIn("orf:health/exercise", saved.topics)
+        self.assertFalse(saved.consent.ad_personalization)
+        self.assertEqual(saved.sync.device_id, "offline-laptop")
+        self.assertEqual(saved.sync.last_clock, 20)
+        self.assertEqual({event.event_id for event in saved.event_log},
+            {event.event_id for event in [*local.event_log, *remote_events]})
+        first_pull = self.profile_path.read_bytes()
+        self.assertEqual(self._run_cli("sync-pull", str(self.profile_path), self.server)[0], 0)
+        self.assertEqual(self.profile_path.read_bytes(), first_pull)
+
+        late = signed(EventOp.SET_OPT_OUT, {"topic": "orf:politics/news", "value": True},
+            1, "2026-01-01T00:00:00+00:00")
+        self.app.state.store.append_events(local.profile_id, [late])
+        self.assertEqual(self._run_cli("sync-pull", str(self.profile_path), self.server)[0], 0)
+        self.assertIn("orf:politics/news", cli.load_profile(self.profile_path).opt_out_topics)
+
+    def test_cli_sync_pull_rejects_tampered_known_events_and_signed_id_conflicts(self) -> None:
+        original = self.profile_path.read_bytes()
+        for resign in (False, True):
+            with self.subTest(resign=resign):
+                def conflicting_sender(method, url, body=None, **kwargs):
+                    response = self._send_json(method, url, body, **kwargs)
+                    if url.endswith("/events/read"):
+                        event = response["events"][0]
+                        event["payload"]["weight"] = 0.1
+                        if resign:
+                            altered = cli.build_event_from_remote(event)
+                            event["signature"] = sign_payload(altered.unsigned_payload(), self.private_key)
+                    return response
+
+                with patch("open_recommender.cli.send_json", side_effect=conflicting_sender):
+                    code, _, stderr = self._run_local_cli("sync-pull", str(self.profile_path), self.server)
+                self.assertEqual(code, 1)
+                self.assertIn("different event" if resign else "Signature verification failed", stderr)
+                self.assertEqual(self.profile_path.read_bytes(), original)
 
     def test_cli_backup_create_and_restore_round_trip(self) -> None:
         profile_path = Path(self.temp_dir.name) / "backup-source.orf"
@@ -198,6 +336,16 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(create_code, 0, create_stderr)
         self.assertIn("alice-backup.orfb", create_stdout)
+        original_backup = backup_path.read_bytes()
+        repeat_code, _, _ = self._run_local_cli("backup-create", str(profile_path), str(backup_path),
+            "--backup-passphrase", "another-passphrase")
+        self.assertEqual(repeat_code, 1)
+        self.assertEqual(backup_path.read_bytes(), original_backup)
+        collision_code, _, collision_error = self._run_local_cli("backup-restore", str(backup_path), str(backup_path),
+            "--backup-passphrase", "backup-passphrase", "--overwrite")
+        self.assertEqual(collision_code, 1)
+        self.assertIn("different files", collision_error)
+        self.assertEqual(backup_path.read_bytes(), original_backup)
 
         restored_profile_path = Path(self.temp_dir.name) / "restored.orf"
         restored_key_path = Path(self.temp_dir.name) / "restored.orf.key"
@@ -218,6 +366,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(restored_profile.profile_id, self.profile.profile_id)
         restored_private_key = cli.load_private_key(restored_key_path, passphrase="backup-passphrase")
         self.assertEqual(private_key_public_key_b64(restored_private_key), self.profile.public_key)
+        if os.name == "posix":
+            for path in (key_path, backup_path, restored_profile_path, restored_key_path):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600, str(path))
 
     def test_cli_backup_restore_rejects_mismatched_key(self) -> None:
         other_private_key, _ = generate_key_pair()
@@ -250,6 +401,70 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(restore_code, 1)
         self.assertIn("does not match the profile", restore_stderr)
+
+    def test_cli_create_and_sync_push_register_signed_identity(self) -> None:
+        profile_path = Path(self.temp_dir.name) / "new.orf"
+        code, _, stderr = self._run_local_cli("create", str(profile_path), "--display-name", "New User")
+        self.assertEqual(code, 0, stderr)
+        profile = cli.load_profile(profile_path)
+        self.assertEqual(profile.event_log[0].clock, 0)
+        with patch("open_recommender.cli.send_json", side_effect=self._send_json):
+            code, _, stderr = self._run_local_cli("sync-push", str(profile_path), self.server)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.app.state.store.get_profile(profile.profile_id).display_name, "New User")
+
+    def test_cli_sync_push_upgrades_legacy_profile_with_encrypted_key(self) -> None:
+        profile_path = Path(self.temp_dir.name) / "legacy.orf"
+        key_path = Path(self.temp_dir.name) / "custom.key"
+        key, public_key = generate_key_pair()
+        profile = ORFProfile.create("Legacy User", public_key, "device-legacy")
+        cli._apply_signed_event(
+            profile, key, EventOp.SET_TOPIC,
+            {"topic": "orf:technology/python", "weight": 0.9, "visibility": "public"},
+        )
+        cli.save_profile(profile_path, profile)
+        save_private_key(key_path, key, passphrase="test-passphrase")
+        with patch("open_recommender.cli.send_json", side_effect=self._send_json):
+            for _ in range(2):
+                code, _, stderr = self._run_local_cli(
+                    "sync-push", str(profile_path), self.server,
+                    "--key-path", str(key_path), "--key-passphrase", "test-passphrase",
+                )
+                self.assertEqual(code, 0, stderr)
+        local = cli.load_profile(profile_path)
+        stored = self.app.state.store.get_profile(profile.profile_id)
+        self.assertEqual(len(local.event_log), 2)
+        self.assertEqual(len(stored.event_log), 2)
+        self.assertEqual(stored.display_name, "Legacy User")
+        self.assertEqual(stored.topics["orf:technology/python"].weight, 0.9)
+
+    def test_cli_can_revoke_and_delete_without_removing_local_files(self) -> None:
+        created = self.client.post(
+            f"/profiles/{self.profile.profile_id}/site-access-requests",
+            json={"site_id": "open-news-demo", "purpose": "Test CLI", "requested_scopes": ["profile.read"]},
+        ).json()
+        request_id = created["access_request"]["request_id"]
+        _, approved = self._run_cli(
+            "site-access-request-approve", request_id, self.server,
+            "--profile-path", str(self.profile_path),
+        )
+        code, revoked = self._run_cli(
+            "site-grant-revoke", approved["grant"]["grant_id"], self.server,
+            "--profile-path", str(self.profile_path),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("revoked_at", revoked["grant"])
+        with patch("open_recommender.cli.send_json") as sender:
+            code, _, stderr = self._run_local_cli("profile-delete", str(self.profile_path), self.server)
+            self.assertEqual(code, 1)
+            self.assertIn("--confirm", stderr)
+            sender.assert_not_called()
+        code, deleted = self._run_cli("profile-delete", str(self.profile_path), self.server, "--confirm")
+        self.assertEqual(code, 0)
+        self.assertTrue(deleted["deleted"])
+        self.assertIsNone(self.app.state.store.get_profile(self.profile.profile_id))
+        self.assertTrue(self.profile_path.exists())
+        self.assertTrue(self.profile_path.with_suffix(".orf.key").exists())
 
     def test_cli_create_with_seed_populates_profile(self) -> None:
         profile_path = Path(self.temp_dir.name) / "seeded-create.orf"
@@ -284,7 +499,7 @@ class CliTests(unittest.TestCase):
 
         seeded_profile = cli.load_profile(profile_path)
         self.assertEqual(len(seeded_profile.topics), 8)
-        self.assertEqual(len(seeded_profile.event_log), output["seed"]["total_events_added"])
+        self.assertEqual(len(seeded_profile.event_log), output["seed"]["total_events_added"] + 1)
         self.assertTrue(
             any(event.op == EventOp.RECOMMEND for event in seeded_profile.event_log)
         )
@@ -319,7 +534,7 @@ class CliTests(unittest.TestCase):
         self.assertGreaterEqual(seed["topic_update_events_added"], cli.DEFAULT_SEED_ACTIVITY_DAYS)
 
         seeded_profile = cli.load_profile(profile_path)
-        self.assertEqual(len(seeded_profile.event_log), seed["total_events_added"])
+        self.assertEqual(len(seeded_profile.event_log), seed["total_events_added"] + 1)
         self.assertEqual(seeded_profile.created_at, seed["first_event_at"])
         first_event_at = datetime.fromisoformat(seed["first_event_at"])
         last_event_at = datetime.fromisoformat(seed["last_event_at"])

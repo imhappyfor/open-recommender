@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from ..crypto import canonical_json
+
 
 DEFAULT_TOP_N = 20
 SITE_SCORE_WEIGHT = 0.7
@@ -38,11 +40,11 @@ def _utc_now() -> str:
 def _parse_timestamp(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,21 +59,17 @@ class RankingCandidateInput:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RankingCandidateInput":
-        candidate_id = str(data.get("candidate_id", "")).strip()
-        if not candidate_id:
+        if not isinstance(data, Mapping):
+            raise ValueError("Each ranking candidate must be an object.")
+        candidate_id = data.get("candidate_id", "")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
             raise ValueError("Each ranking candidate must include a non-empty candidate_id.")
+        candidate_id = candidate_id.strip()
 
         raw_site_score = data.get("site_score")
-        if isinstance(raw_site_score, bool):
-            raise ValueError("Candidate site_score must be a number between 0.0 and 1.0.")
-        try:
-            site_score = float(raw_site_score)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "Candidate site_score must be a number between 0.0 and 1.0."
-            ) from error
-        if site_score < 0.0 or site_score > 1.0:
-            raise ValueError("Candidate site_score must be between 0.0 and 1.0.")
+        if type(raw_site_score) not in (int, float) or not 0.0 <= raw_site_score <= 1.0:
+            raise ValueError("Candidate site_score must be a finite number between 0.0 and 1.0.")
+        site_score = float(raw_site_score)
 
         published_at = str(data["published_at"]) if data.get("published_at") is not None else None
         if published_at is not None and _parse_timestamp(published_at) is None:
@@ -81,12 +79,10 @@ class RankingCandidateInput:
         if raw_candidate_topics is None:
             candidate_topics: tuple[str, ...] = ()
         elif isinstance(raw_candidate_topics, list):
+            if any(not isinstance(topic, str) or not topic.strip() for topic in raw_candidate_topics):
+                raise ValueError("Candidate candidate_topics must contain non-empty strings.")
             candidate_topics = tuple(
-                dict.fromkeys(
-                    str(topic).strip()
-                    for topic in raw_candidate_topics
-                    if str(topic).strip()
-                )
+                dict.fromkeys(topic.strip() for topic in raw_candidate_topics)
             )
         else:
             raise ValueError("Candidate candidate_topics must be an array of topic strings.")
@@ -96,6 +92,7 @@ class RankingCandidateInput:
             metadata: dict[str, Any] = {}
         elif isinstance(raw_metadata, Mapping):
             metadata = dict(raw_metadata)
+            canonical_json(metadata)
         else:
             raise ValueError("Candidate metadata must be an object.")
 
@@ -124,15 +121,19 @@ class GrantSessionRankRequest:
         *,
         default_schema_version: str,
     ) -> "GrantSessionRankRequest":
+        if not isinstance(data, Mapping):
+            raise ValueError("Ranking request must be an object.")
         raw_candidates = data.get("candidates")
         if not isinstance(raw_candidates, list) or not raw_candidates:
             raise ValueError("Ranking request candidates must be a non-empty array.")
         candidates = tuple(RankingCandidateInput.from_dict(item) for item in raw_candidates)
+        if len({candidate.candidate_id for candidate in candidates}) != len(candidates):
+            raise ValueError("Ranking candidate IDs must be unique within a request.")
 
         raw_schema_version = data.get("schema_version", default_schema_version)
-        schema_version = str(raw_schema_version).strip()
-        if not schema_version:
+        if not isinstance(raw_schema_version, str) or not raw_schema_version.strip():
             raise ValueError("Ranking request schema_version must be a non-empty string.")
+        schema_version = raw_schema_version.strip()
 
         raw_top_n = data.get("top_n")
         if raw_top_n is None:
@@ -167,13 +168,17 @@ class RankingFeedbackEvent:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RankingFeedbackEvent":
-        event_id = str(data.get("event_id", "")).strip()
-        if not event_id:
+        if not isinstance(data, Mapping):
+            raise ValueError("Each feedback event must be an object.")
+        event_id = data.get("event_id", "")
+        if not isinstance(event_id, str) or not event_id.strip():
             raise ValueError("Each feedback event must include a non-empty event_id.")
+        event_id = event_id.strip()
 
-        candidate_id = str(data.get("candidate_id", "")).strip()
-        if not candidate_id:
+        candidate_id = data.get("candidate_id", "")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
             raise ValueError("Each feedback event must include a non-empty candidate_id.")
+        candidate_id = candidate_id.strip()
 
         try:
             event_type = RankingFeedbackType(str(data.get("event_type", "")).strip())
@@ -191,12 +196,10 @@ class RankingFeedbackEvent:
         if raw_candidate_topics is None:
             candidate_topics: tuple[str, ...] = ()
         elif isinstance(raw_candidate_topics, list):
+            if any(not isinstance(topic, str) or not topic.strip() for topic in raw_candidate_topics):
+                raise ValueError("Feedback candidate_topics must contain non-empty strings.")
             candidate_topics = tuple(
-                dict.fromkeys(
-                    str(topic).strip()
-                    for topic in raw_candidate_topics
-                    if str(topic).strip()
-                )
+                dict.fromkeys(topic.strip() for topic in raw_candidate_topics)
             )
         else:
             raise ValueError("Feedback candidate_topics must be an array of topic strings.")
@@ -206,6 +209,7 @@ class RankingFeedbackEvent:
             metadata: dict[str, Any] = {}
         elif isinstance(raw_metadata, Mapping):
             metadata = dict(raw_metadata)
+            canonical_json(metadata)
         else:
             raise ValueError("Feedback metadata must be an object.")
 
@@ -246,14 +250,16 @@ class GrantSessionFeedbackRequest:
         *,
         default_schema_version: str,
     ) -> "GrantSessionFeedbackRequest":
+        if not isinstance(data, Mapping):
+            raise ValueError("Feedback request must be an object.")
         raw_events = data.get("events")
         if not isinstance(raw_events, list) or not raw_events:
             raise ValueError("Feedback request events must be a non-empty array.")
 
         raw_schema_version = data.get("schema_version", default_schema_version)
-        schema_version = str(raw_schema_version).strip()
-        if not schema_version:
+        if not isinstance(raw_schema_version, str) or not raw_schema_version.strip():
             raise ValueError("Feedback request schema_version must be a non-empty string.")
+        schema_version = raw_schema_version.strip()
 
         events = tuple(RankingFeedbackEvent.from_dict(item) for item in raw_events)
         return cls(schema_version=schema_version, events=events)
@@ -403,7 +409,7 @@ class GrantSessionRanker:
         )
         return min(1.0, max(0.0, overlap_weight / total_weight))
 
-    def _freshness_score(self, published_at: str | None) -> float:
+    def _freshness_score(self, published_at: str | None, *, now: datetime) -> float:
         if published_at is None:
             return 0.5
 
@@ -411,7 +417,6 @@ class GrantSessionRanker:
         if parsed is None:
             return 0.5
 
-        now = datetime.now(timezone.utc)
         hours_ago = max(0.0, (now - parsed).total_seconds() / 3600)
         boost = pow(2.0, -(hours_ago / FRESHNESS_HALF_LIFE_HOURS))
         return min(1.0, max(0.0, boost))
@@ -461,11 +466,16 @@ class GrantSessionRanker:
         *,
         site_id: str,
         grant_id: str,
+        now: datetime | None = None,
     ) -> GrantSessionRankingResult:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Ranking time must include a timezone.")
+        now = now.astimezone(timezone.utc)
         ranked_candidates: list[tuple[RankingCandidateInput, float, float, float, float]] = []
         for candidate in ranking_request.candidates:
             topic_affinity = self._topic_affinity(candidate.candidate_topics)
-            freshness = self._freshness_score(candidate.published_at)
+            freshness = self._freshness_score(candidate.published_at, now=now)
             feedback_affinity = self.feedback_signals.score(
                 candidate_id=candidate.candidate_id,
                 candidate_topics=candidate.candidate_topics,
@@ -525,5 +535,5 @@ class GrantSessionRanker:
             candidate_count=len(ranking_request.candidates),
             top_n=effective_top_n,
             ranked_candidates=tuple(serialized_candidates),
-            reranked_at=_utc_now(),
+            reranked_at=now.replace(microsecond=0).isoformat(),
         )

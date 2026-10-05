@@ -6,13 +6,14 @@ Exercises the complete ORF flow against a running service:
 
 Usage:
     # Start the service first:
-    uvicorn open_recommender.service:app --port 8000
+    uvicorn open_recommender.service:create_app --factory --host 127.0.0.1 --port 8000
 
     # Run the dry-run (auto-approves, no browser required):
     python examples/pilot_dry_run.py http://127.0.0.1:8000
 
-    # With hosted sync token gating:
-    python examples/pilot_dry_run.py http://127.0.0.1:8000 --sync-token my-secret
+    # For a credentialed pilot, supply ORF_SITE_TOKEN in protected environment
+    # configuration; OPEN_RECOMMENDER_SYNC_TOKEN is a separate optional gate.
+    # Never print either token or put it in browser code.
 
     # Quiet mode (assertions only, no narration):
     python examples/pilot_dry_run.py http://127.0.0.1:8000 --quiet
@@ -20,13 +21,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Any
 
 from open_recommender.crypto import generate_key_pair, sign_payload
-from open_recommender.models import EventOp, ORFProfile, build_signed_event
+from open_recommender.models import EventOp, ORFProfile, build_registration_event, build_signed_event
 from open_recommender.partner_sdk import PartnerClient, PartnerSDKError
-from open_recommender.cli import send_json
+from open_recommender.cli import send_json, signed_owner_payload
 
 
 # ---------------------------------------------------------------------------
@@ -73,15 +75,20 @@ def run_pilot_dry_run(
     server: str,
     *,
     sync_token: str | None = None,
+    site_token: str | None = None,
 ) -> dict[str, Any]:
     base = server.rstrip("/")
-    sdk = PartnerClient(base, sync_token=sync_token)
+    sdk = PartnerClient(base, sync_token=sync_token,
+                        site_id="open-news-demo" if site_token is not None else None, site_token=site_token)
 
     # ------------------------------------------------------------------
     step(1, "Create a local ORF profile")
     # ------------------------------------------------------------------
     private_key, public_key = generate_key_pair()
     profile = ORFProfile.create("Pilot User", public_key, "device-dry-run")
+    registration = build_registration_event(profile)
+    registration.signature = sign_payload(registration.unsigned_payload(), private_key)
+    profile.apply_event(registration)
 
     # Seed some topic preferences
     for topic, weight, visibility in [
@@ -115,12 +122,15 @@ def run_pilot_dry_run(
     # ------------------------------------------------------------------
     health = send_json("GET", f"{base}/health")
     assert_ok(health["status"] == "ok", "Service is healthy")
-    sync_required = health["service"]["sync_auth_required"]
-    info(f"Sync auth required: {sync_required}")
+    sync_required = health["service"]["sync_token_required"]
+    info(f"Additional shared sync token required: {sync_required}")
     if sync_token:
-        assert_ok(sync_required, "Service reports sync_auth_required=true (paid tier active)")
+        assert_ok(sync_required, "Service requires the additional shared sync token")
     else:
-        assert_ok(not sync_required, "Service reports sync_auth_required=false (open sync)")
+        assert_ok(not sync_required, "No shared sync token configured; owner proof still required for reads")
+    assert_ok(health["service"]["sync_read_owner_proof_required"], "Raw history reads require the owner's signature")
+    assert_ok(health["service"]["site_auth_required"] == (site_token is not None),
+              "Partner authentication configuration matches the supplied backend credential")
 
     # ------------------------------------------------------------------
     step(4, "Partner SDK: create access request")
@@ -142,10 +152,10 @@ def run_pilot_dry_run(
     approve_resp = send_json(
         "POST",
         f"{base}/site-access-requests/{request_id}/approve",
-        {
+        signed_owner_payload(base, profile_id, "approve", request_id, {
             "approved_scopes": ["profile.read", "topics.public", "topics.selective:orf:media/podcasts"],
             "actor": "pilot-dry-run",
-        },
+        }, private_key, sender=send_json),
     )
     assert_ok(approve_resp["access_request"]["status"] == "approved", "Request approved")
 
@@ -206,7 +216,9 @@ def run_pilot_dry_run(
     # ------------------------------------------------------------------
     step(11, "Pull events back to verify delta sync round-trip")
     # ------------------------------------------------------------------
-    pull_resp = sdk.pull_events(profile_id)
+    read_body = signed_owner_payload(base, profile_id, "sync-read", profile_id,
+        {"after_clock": 0}, private_key, sender=send_json)
+    pull_resp = sdk.pull_events(profile_id, owner_proof=read_body["owner_proof"])
     pulled_events = pull_resp["events"]
     info(f"Pulled {len(pulled_events)} total events from service")
     assert_ok(len(pulled_events) >= 4, f"At least 4 events stored ({len(pulled_events)} pulled)")
@@ -214,24 +226,19 @@ def run_pilot_dry_run(
     # ------------------------------------------------------------------
     step(12, "Revoke grant (user removes site access)")
     # ------------------------------------------------------------------
-    # Fetch the grant_id from the session
-    session_detail = send_json("GET", f"{base}/site-access-requests/{request_id}")
-    grant_id = session_detail.get("grant", {}).get("grant_id")
-    if grant_id:
-        csrf_token = send_json(
-            "GET",
-            f"{base}/site-access-requests/{request_id}",
-        ).get("consent_review_url", "")
-        # Use the API-level revoke (browser flow requires CSRF; API approve/deny flow used here)
-        revoke_resp = send_json(
-            "POST",
-            f"{base}/consent/grants/{grant_id}/revoke",
-            {"csrf_token": "skip"},  # service validates via hmac; skip for dry-run narration
-        )
-        info(f"Revoke response (may be 403 if CSRF required via browser): {revoke_resp}")
+    grant_id = approve_resp["grant"]["grant_id"]
+    revoke_resp = send_json(
+        "POST", f"{base}/grants/{grant_id}/revoke",
+        signed_owner_payload(base, profile_id, "revoke", grant_id,
+            {"reason": "Pilot dry-run complete."}, private_key, sender=send_json),
+    )
+    assert_ok("revoked_at" in revoke_resp["grant"], "Owner-signed grant revocation completed")
+    try:
+        sdk.get_projection(session_id)
+    except PartnerSDKError as error:
+        assert_ok(error.status_code == 400, "Revoked session can no longer read its projection")
     else:
-        info("Grant ID not directly available in request detail – revoke step skipped for dry-run")
-        info("In a real flow, users revoke from /consent/grants in the browser trust app")
+        fail("Revoked session still returned a projection")
 
     # ------------------------------------------------------------------
     print(f"\n{'═'*60}")
@@ -241,7 +248,8 @@ def run_pilot_dry_run(
     print(f"  Session:   {session_id}")
     print(f"  Topics in projection: {len(proj_topics)}")
     print(f"  Events pushed/pulled: 1 pushed, {len(pulled_events)} pulled")
-    print(f"  Sync auth: {'token-gated (paid tier)' if sync_token else 'open (free tier)'}")
+    print(f"  Sync reads: owner-signed{', plus shared token' if sync_token else ''}")
+    print(f"  Partner auth: {'backend token' if site_token is not None else 'unauthenticated local preview'}")
     print(f"{'═'*60}\n")
 
     return {
@@ -258,7 +266,7 @@ def run_pilot_dry_run(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="End-to-end Open Recommender pilot dry-run.",
+        description="End-to-end Open Recommender pilot dry-run. Backend credential: ORF_SITE_TOKEN environment variable.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -266,8 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sync-token",
         metavar="TOKEN",
-        default=None,
-        help="Bearer token for hosted sync endpoints (omit for open/free-tier sync).",
+        default=os.getenv("OPEN_RECOMMENDER_SYNC_TOKEN"),
+        help="Optional shared sync gate; defaults to OPEN_RECOMMENDER_SYNC_TOKEN. Prefer protected environment configuration.",
     )
     parser.add_argument(
         "--quiet",
@@ -283,9 +291,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _quiet = args.quiet
     try:
-        run_pilot_dry_run(args.server, sync_token=args.sync_token)
+        run_pilot_dry_run(args.server, sync_token=args.sync_token, site_token=os.getenv("ORF_SITE_TOKEN"))
     except PartnerSDKError as exc:
         print(f"SDK error: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 1

@@ -1,261 +1,238 @@
 # Transparency & Security
 
-This document describes exactly what Open Recommender stores, logs, and processes — and what it doesn't.
+Open Recommender currently uses a **trusted sync service**. The CLI can work entirely
+offline, but registering or syncing a profile sends its full preference state and
+signed event history to the service. Private visibility restricts partner projections;
+it does not hide synced topics from the service operator.
 
-**tl;dr:** Your `.orf` profile file lives on your device. We don't store your recommendation data. We can't see your private topics or the sites you reject. You can read everything we *do* process by opening your file in a text editor.
+## What the service stores
 
----
+Registration and sync persist:
 
-## What We Store
+- A profile document containing identity metadata, topics of all visibility levels,
+  opt-outs, consent settings, and sync state.
+- Signed events, including historical private/selective topics and recommendation
+  payloads. Removing a topic does not erase its historical events.
+- Challenges and their use status; site access requests, approvals, denials, grants,
+  and sessions; audit records linking those operations to profiles and sites.
+- Optional ranking feedback, including submitted candidate IDs, topics, timestamps,
+  and metadata. Feedback is scoped to a grant and does not become portable ORF state.
 
-### Hosted Sync (Optional, Paid Tier)
+The service can therefore see private topics, requested sites, denied requests,
+and any recommendation data included in synced events. It does not receive the user's
+private signing key through the registration, sync, or challenge APIs.
 
-If you enable hosted sync (by setting `OPEN_RECOMMENDER_SYNC_TOKEN`), the service stores:
+SQLite stores this data as readable JSON. There is no end-to-end encryption.
+The `hosted_sync` flag is stored preference metadata; it currently does not prevent
+explicit CLI pushes, profile registration, or event uploads. Setting
+`OPEN_RECOMMENDER_SYNC_TOKEN` gates event reads/writes with a shared service token;
+it does not enable encryption. Raw history reads separately require a one-time
+proof signed by that profile's owner, whether or not a shared token is configured.
+The proof binds the profile, read purpose, and exact cursor. A shared token alone
+cannot read another user's history. The former unauthenticated GET is retired.
+See [owner-only sync](protocol.md#sync-boundaries).
 
-- **Your signed profile events** — the cryptographic record of your preference updates (topic set/remove, consent changes).
-- **Event metadata** — timestamp, logical clock, signature verification status.
-- **A signed challenge** — a temporary cryptographic proof that you control your Ed25519 key, used only during the challenge-response flow.
+## What partner projections expose
 
-### Grant-Session Ranking Feedback
+Public projections include profile identity, display name, timestamps, consent
+summary, and public topics allowed by sharing settings. They omit the entire
+`opt_out_topics` field: a private or never-shared topic must not become public
+merely because its owner opted out. Signed opt-outs remain in the owner file,
+backups, and the full history uploaded to the trusted service.
 
-If a site uses `POST /grant-sessions/{session_id}/rank/feedback`, the service stores:
+Earlier preview responses included opt-out names. This change cannot recall
+previously downloaded or cached responses; operators and recipients must handle
+those copies under their retention/deletion policies.
 
-- **Explicit ranking feedback events (optional)** — narrow site-local outcomes such as `click`, `dismiss`, or `save`, stored per grant to improve later reranking for that same site grant.
+Consented projections include identity and approved public/selective topics.
+Private topics and opted-out topics are excluded from their topic lists.
+Scopes control these projection responses, not the full sync event stream.
+Raw history is for the owner's sync client, not a site integration. Do not give
+a partner an owner sync proof or a full profile as a shortcut around consent.
 
-### What We Do NOT Store
+A site can retain information it already received. Revoking a grant blocks future
+session exchanges and subsequent use of existing sessions through the service;
+it cannot delete a site's copies.
 
-- **A public or consented projection copy of your private topics** — private topics stay out of projections, and selective topics appear only when a grant explicitly covers them.
-- **Your opted-out topics as active preferences** — if you remove a topic, that removal is kept only as a signed event for conflict resolution, not as an active topic weight.
-- **Your general browsing history or cross-site behavior graph** — the service does not crawl, infer, or publish your behavior. If a site explicitly submits a ranking feedback event, that event stays local to the hosted service and grant; it does not become portable ORF profile data.
-- **Your Ed25519 private key** — it lives only on your device. We never see it.
-- **Any personally identifiable information** beyond what you explicitly put in your profile (display name, device ID).
+## Signed registration and event integrity
 
----
+Initial registration requires one signed `set_profile` event at clock zero.
+Its payload binds `display_name`, `created_at`, and `schema_version`; its envelope
+binds the profile ID, device ID, and timestamp. The creation timestamp must match
+the signed event timestamp. The profile ID is derived from the public key.
 
-## What Each Component Logs
+Both `POST /profiles` and the local profile importer merge verified events into the
+stored event history. Hosted state is rebuilt from that history, so unsigned snapshot
+fields cannot replace it and stale profile uploads cannot roll it back.
 
-### Local CLI (`open_recommender.cli`)
+Event retries are idempotent. Reusing an event ID with different signed content is
+rejected. Registration and event appends commit their event rows and profile state
+in one SQLite transaction; invalid batches leave no partial writes.
+Concurrent writers acquire the database write lock before reading the stored history.
 
-**Logs:** Local file system only. No network calls except to sync or partner sites you explicitly request.
+Signatures authenticate event content. They do not encrypt it, prove freshness,
+or prevent someone from replaying a valid signed event. Replays of known events
+do not reset state because the store retains the full history.
+The CLI verifies downloaded signatures before saving a pull and leaves the local
+file unchanged if verification fails. A signature does not prove a service has
+returned complete or current history; a malicious operator can omit valid events.
 
-**What it does:** Creates, edits, exports, and backs up your `.orf` file. All state changes are written to your local profile file.
+New CLI profiles contain the signed registration event. To upgrade an older local
+profile, run `sync-push` with its matching key; the CLI adds and saves the event
+before uploading. It accepts `--key-path` and `--key-passphrase` for that step.
+Older hosted profiles must receive this registration event before further event
+appends. Use the upgraded file for browser imports and across devices.
 
-**Verification:** Run `cat ~/.orf` and you'll see the exact JSON. No hidden state.
+## Active profiles and backups
 
----
+- **`.orf`:** readable JSON. Signed events provide integrity when verified; the file
+  itself is not encrypted and its unsigned snapshot fields are not authenticated.
+- **`.orf.key`:** a separate PEM private key. CLI creation can encrypt it with
+  `--passphrase`; otherwise it is unencrypted.
+- **`.orfb`:** readable JSON containing the full profile and a passphrase-encrypted
+  private key. **Only the key is encrypted.** Topic data and event history remain
+  readable in the backup.
 
-### Service (`open_recommender.service`)
+CLI profile, key, and backup saves stage bytes in a hidden `.orf-save-*.orf` file
+in the destination directory, flush it, and publish the completed file without
+truncating the previous version. On Unix, the staged and saved files are owner-only
+(`0600`), including replacements of older, more permissive files. On Windows,
+use a private directory with appropriate access-control rules; Unix mode bits are
+not a Windows ACL guarantee. Filesystem permissions are not encryption.
 
-**Logs:** HTTP request/response events if `DEBUG` is enabled; otherwise, only error logs.
+New identity and backup creation refuse existing destinations, including a file
+that appears during publication. Symbolic-link destinations are refused. Restore
+requires distinct backup/profile/key paths and keeps the input backup intact;
+existing output files still require `--overwrite`.
 
-**What it does:**
-1. **Event ingestion** (`POST /profiles/{id}/events`) — accepts signed events, validates signatures, stores append-only events.
-2. **Event retrieval** (`GET /profiles/{id}/events`) — returns your signed events (requires valid sync token if token-gating is enabled).
-3. **Projection** (`GET /grant-sessions/{session_id}/projection`) — builds a view of your public preferences based on consent settings; does not store this view, only computes it on-demand.
-4. **Ranking feedback ingestion** (`POST /grant-sessions/{session_id}/rank/feedback`) — stores narrow site-local outcome events for later reranks under the same grant; does not mutate the ORF profile or projection contract.
-5. **Health check** (`GET /health`) — reports service status; no profile data involved.
+These are **per-file** guarantees on a local filesystem, not a transaction across
+profile and key. The key is saved first; a later profile-save failure can leave a
+key without a matching output profile. Inspect both paths before retrying, and
+keep the original backup when restoring. Hard-link support is required for
+no-overwrite publication. File flushing does not guarantee directory durability
+after power loss. A forcibly killed process may leave an owner-only staged file;
+do not share it, and remove it only after confirming the required recovery files.
+Existing files are not automatically hardened until saved again.
 
-**What it doesn't do:**
-- Infer hidden preferences from your data
-- Track which sites request your profile
-- Store requests that failed signature verification
-- Log your full profile to stdout or a file
-- Analyze patterns across users
-- Turn site-local ranking feedback into public profile fields or consented projection fields
+The browser demo imports a key into tab memory to sign challenges. Site-controlled
+JavaScript with access to that memory must be trusted. This demo is not an isolated
+production wallet or signer.
 
----
+## Deletion and retention
 
-### Partner SDK (`open_recommender.partner_sdk`)
-
-**Logs:** Only HTTP errors and network timeouts (to help debug integration issues).
-
-**What it does:** Site-side wrapper for calling the service (request access, pull events, verify signatures). No profile data is stored in the SDK; it's stateless.
-
-**What it doesn't do:** Cache or log your preferences locally. Every call to the service uses current state.
-
----
-
-### Partner Site (Your Application)
-
-**Out of scope for Open Recommender,** but important to understand:
-- Your site receives a **projection** (public topics + consent flags).
-- What your site *does* with that projection is your responsibility.
-- Open Recommender can't see or audit what your site does after receiving the projection.
-- If you want to guarantee transparency, publish your own data-handling policy clearly.
-
----
-
-## How to Verify This
-
-### 1. Inspect Your Profile
-
-Your `.orf` file is human-readable JSON. You can read it directly:
-
-```bash
-cat ~/.orf | jq .
-```
-
-You'll see:
-- `profile_id` — your Ed25519 public key (your identity)
-- `display_name` and `device_id` — what you set
-- `topics` — the preferences you created, with visibility (`public`/`selective`/`private`)
-- `opt_outs` — the topics you removed
-- `consent` — flags like `share_public_topics`, `ad_personalization`, `hosted_sync`
-- `events` — a signed log of every preference change (creator, timestamp, signature)
-
-Example:
-```json
-{
-  "profile_id": "9a3c...",
-  "display_name": "Alice",
-  "topics": {
-    "orf:technology/python": {
-      "score": 0.9,
-      "visibility": "public"
-    },
-    "orf:politics/us": {
-      "score": 0.5,
-      "visibility": "private"
-    }
-  },
-  "events": [
-    {
-      "op": "set_topic",
-      "topic": "orf:technology/python",
-      "score": 0.9,
-      "visibility": "public",
-      "created_at": "2026-01-15T10:30:00Z",
-      "signature": "..."
-    }
-  ]
-}
-```
-
-**What this tells you:**
-- Nobody can infer your private topics (they're stored locally, not transmitted).
-- Every change is signed — if someone modifies your profile, you'll see a signature mismatch.
-- Your public topics are the only data the service can process.
-
-### Important note: `.orf` plaintext vs `.orfb` encryption
-
-Open Recommender uses two file types with different security properties:
-
-- **`.orf` (active profile):** plain-text JSON by design, so you can inspect and audit it in a text editor.
-- **`.orfb` (backup bundle):** encrypted with your backup passphrase.
-
-So the active `.orf` profile is **not encrypted JSON**. Its protection model is:
-
-- **Integrity/authenticity:** Ed25519 signatures detect tampering.
-- **Confidentiality at rest:** provided by encrypted backups (`.orfb`), not by the live `.orf` file.
-
-**Device compromise is out of scope in the current model.** If malware or an attacker can read files on your device, they can read your `.orf` preferences (and may access key material). Open Recommender does not claim to protect data on a compromised host.
-
-### 2. Inspect the Service's View
-
-If you sync with a hosted service, you can request your own events:
+The owner can delete hosted data with the CLI:
 
 ```bash
-python -m open_recommender.cli sync-pull profile.orf http://open-recommender.example.com
+python -m open_recommender.cli profile-delete profile.orf http://127.0.0.1:8000 --confirm
 ```
 
-Compare the service's events to your local `.orf` file. They should be identical (append-only, no deletions, no mutations).
+The command uses the matching key to sign a one-time deletion challenge, then calls
+`POST /profiles/{profile_id}/delete`. The service removes the profile, signed events,
+requests, grants, sessions, challenges, audit records, and ranking feedback in one
+transaction, including the deletion challenge itself. It returns counts of removed
+rows. Other profiles, the site registry, and service configuration remain intact.
+Local profiles, keys, and backup files are not deleted.
 
-### 3. Read the Code
+Deletion affects the live database only. It does not purge operator backups or logs,
+erase partner copies, or guarantee forensic erasure of SQLite pages/WAL files.
+There is no automatic retention cleanup. Expiry controls access but does not remove rows.
+Re-uploading the retained signed profile can register it again; deletion is not a ban
+on future uploads.
 
-All source code is on GitHub. The files you should audit:
-- `src/open_recommender/models.py` — profile schema and visibility rules
-- `src/open_recommender/recommender/feed.py` — local feed aggregation and ranking logic
-- `src/open_recommender/service.py` — API endpoints and what they process
-- `src/open_recommender/store.py` — database schema and query logic
-- `tests/test_service.py` — test cases showing what the API accepts and rejects
+To stop sending data, stop invoking registration and sync commands. Deleting a local
+file or setting `hosted_sync=false` does not delete hosted copies.
+Ask the operator about backup/log retention separately. Keep local files and keys
+until recovery needs have been considered.
 
-If something looks off, open an issue or submit a PR.
+## Owner-authenticated consent
 
----
+Approval, denial, revocation, hosted deletion, and raw sync reads require an `owner_proof` signed
+by the profile's Ed25519 key. The service issues a five-minute challenge bound to the
+action, target ID, and exact JSON parameters, including scopes, reason, actor label,
+and grant expiry when supplied. A profile-login or grant-exchange challenge cannot
+authorize these actions.
 
-## Consent Revocation & Deletion
+Proof consumption and the mutation share one transaction. Replays, changed parameters,
+wrong keys, and expired challenges fail. A rejected action does not consume its proof.
+Browser decisions also require their existing localhost check and review token.
+The local trust pages and React demo load an unencrypted key in browser memory and
+send only its signature. Encrypted keys are supported through the CLI.
+The Python sample site optionally loads a local demo key instead; every sample
+route requires localhost. Backend credentials stay server-side, personal pages
+disable caching, and rendered profile/request text is HTML-escaped. Its memory-only
+sessions and demo signer are not a production authentication system. Do not expose
+it through a proxy that makes remote requests appear local.
 
-### Can I revoke access?
+## Logs and audit inspection
 
-**Yes.** If a partner site has your projection, you can revoke their grant from the localhost trust app:
+The service writes audit rows for request decisions, challenge issuance/verification,
+grant sessions, projection reads, owner sync reads (cursor/count only), and ranking operations. An admin token enables
+inspection through `/admin/audit-events`.
 
-```text
-http://127.0.0.1:8000/consent/grants
-```
+HTTP access logs and error logs depend on Uvicorn and deployment configuration.
+The reference service does not manage log rotation or operator retention.
+The Python partner SDK raises HTTP/network errors; it does not configure logging
+or cache preferences.
 
-This:
-- Marks the grant as revoked in the service.
-- Revoked grants cannot mint new exchange sessions.
-- Does **not** delete data the site *already received*. The site must respect the revocation on their end.
+## Current threat boundary
 
-**Important:** Open Recommender can't force sites to delete data they already have. You need to trust their privacy policy, or choose sites that publish data-retention guarantees.
+- The device and its user-side signing client are trusted. Malware with file access
+  can read profiles and may steal keys.
+- The sync operator is trusted with full uploaded state. A service-wide token is
+  not a boundary between different profile owners; one-time owner proofs enforce
+  that boundary on raw history reads, but do not hide history from the operator.
+- Private-key compromise permits forged events. Key rotation is not implemented.
+- Consent decisions require signed owner proofs. Local pages additionally use a
+  loopback check and review tokens. Optional backend token hashes bind partner
+  requests and sessions to a registered site; unset configuration does not
+  authenticate sites. Tokens do not verify domain ownership or grant owner rights.
+  A stolen backend token can use that site's known active sessions, but not another
+  site's sessions. Rotate the token and revoke affected grants after compromise.
+  Do not put credentials in browser bundles, URLs, or logs. See
+  [backend setup](pilot-integration.md#backend-credentials). The local consent flow
+  still belongs on a trusted local machine.
+- Browser CORS allows localhost origins. The browser demo and local trust surface
+  do not yet provide a production remote consent/signing flow.
+- Profile IDs are stable across sites and can enable correlation.
+- Rate limiting covers selected auth-sensitive and profile-write routes. Its
+  thread-safe, expiring in-process state is capped at 10,000 client/bucket pairs;
+  it is not shared across workers and does not prevent profile enumeration.
+- Request/item limits and cumulative per-profile/per-grant history budgets reject
+  excess work atomically; no history is clipped. They do not impose global disk,
+  connection, profile-count, challenge, or audit-retention quotas. See
+  [service budgets](protocol.md#service-budgets) and operator constraints in
+  [Architecture](architecture.md#deployment-boundary).
+- Use HTTPS outside localhost; the reference application does not terminate TLS.
 
-### Can I delete my data from the service?
+Keep the current service on a trusted local machine. For this version, share only
+profiles whose full history you are comfortable disclosing to that service, and
+treat partner projections as a separate, narrower sharing boundary.
 
-**Yes.** There is no "delete account" button because you don't have an account. But if you want to:
-1. Stop syncing: delete your local `.orf` file.
-2. Contact the service operator: ask them to delete the profile ID `<your-profile-id>` from their database.
+## Verify the behavior
 
-Because we don't store PII, deletion is simple — just remove the events log tied to your profile ID.
+Dependency advisory checks run in the repository's test workflow: `pip-audit`
+checks the Python runtime dependency resolution and `npm audit` checks the demo's
+locked dependency tree. They report known advisories, not all reachable exploits
+or undiscovered issues. Use a fresh environment and keep dependencies updated;
+see [contributor checks](../CONTRIBUTING.md#useful-commands).
 
----
+Event import, sync, and local application reject malformed signed fields before
+changing state. Weights/scores must be finite numbers in `[0, 1]`, consent values
+must be booleans, and clocks must be safe integers. Ranking/feedback also reject
+non-finite nested metadata. Separate service budgets bound individual requests and
+retained histories, not overall deployment growth.
 
-## Rate Limiting & Abuse Prevention
+Inspect a local profile or backup in a text editor. Compare its event history using
+an [owner-signed read](protocol.md#sync-boundaries), keeping in mind that
+`after_clock=0` returns mutations after the clock-zero registration event.
 
-The service enforces per-client rate limiting on auth-sensitive routes including challenge issuance, verify, exchange, approvals, and projection reads.
+Relevant implementation and regression coverage:
 
-The rate limit window and request ceiling are configurable via `OPEN_RECOMMENDER_RATE_LIMIT_WINDOW_SECONDS` and `OPEN_RECOMMENDER_RATE_LIMIT_MAX_REQUESTS`. The health endpoint reports the active values.
-
-This prevents:
-- Brute-force attacks on challenge-response flows
-- Flooding the database with junk events
-- Profile enumeration (scanning for valid profile IDs)
-
----
-
-## Data Retention
-
-**Hosted sync:**
-- Events are kept forever (append-only log).
-
-**Local CLI:**
-- Your `.orf` file is kept as long as you don't delete it.
-- Backups are encrypted with your passphrase (nobody but you can decrypt them).
-
-**Service logs:**
-- The reference service does not add any log rotation or retention policy by default. Log handling is the responsibility of the operator deploying the service.
-- No profile data is included in logs unless a request fails signature verification (in which case we log the validation error, not the profile itself).
-
----
-
-## Security Assumptions
-
-Open Recommender assumes:
-
-1. **Your device is not compromised.** If malware has access to your `.orf` file, it has your preferences. There's no solution for a compromised device.
-2. **The service operator is honest.** We publish the code, but we can't prevent an operator from running different code. Use a trusted service, or run your own.
-3. **Signature verification works.** We use Ed25519, which is cryptographically sound. But if your private key is stolen, an attacker can forge signatures on your behalf.
-4. **Partner sites honor consent.** If you approve a topic for a site, we can't prevent them from storing or selling that data. You must read their privacy policy.
-5. **Network eavesdropping is prevented by TLS.** All communication to the service should use HTTPS. HTTP is unsafe.
-
----
-
-## What This Doesn't Guarantee
-
-Open Recommender is **not:**
-
-- A guarantee that you're anonymous (your profile ID is deterministic from your Ed25519 key; observant sites could correlate you across platforms).
-- A replacement for a privacy policy (you still need to read and trust each site's data handling).
-- A technical solution to the problem of data shared with consent (if you approve a topic, sites can use it; we can't technically prevent that).
-- Protection against algorithmic bias (we don't audit whether sites use your preferences fairly).
-
----
-
-## Questions?
-
-- **Is this code auditable?** Yes. Everything is open-source. File an issue or submit an audit report.
-- **Can I run my own service?** Yes. The service code is public. Run it on your own infrastructure.
-- **What if I don't trust the hosted sync?** Don't use it. The CLI works entirely offline, and you can manually sync events by sharing your `.orf` file.
-- **What if a site violates the consent I gave?** Report it to the site, to Open Recommender, and (if applicable) to a privacy regulator.
-
-We aim to make the system transparent enough that you can trust it by *understanding* it, not by blind faith.
+- [Profile model and registration event](../src/open_recommender/models.py)
+- [Transactional event merge and storage](../src/open_recommender/store.py)
+- [API and local trust surfaces](../src/open_recommender/service.py)
+- [CLI and backup format](../src/open_recommender/cli.py)
+- [Profile integrity regression tests](../tests/test_profile_integrity.py)
+- [Owner proof and private-history boundary tests](../tests/test_owner_actions.py)
+- [Malformed input and atomic rejection tests](../tests/test_input_validation.py)
+- [Streamed bodies, history budgets, and concurrency checks](../tests/test_resource_limits.py)

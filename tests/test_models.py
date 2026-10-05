@@ -63,6 +63,8 @@ class ModelTests(unittest.TestCase):
 
         public_topics = {item["topic"] for item in self.profile.public_projection()["topics"]}
         self.assertEqual(public_topics, {"orf:technology/python"})
+        self.assertNotIn("opt_out_topics", self.profile.public_projection())
+        self.assertEqual(self.profile.to_document()["opt_out_topics"], ["orf:politics/news"])
 
     def test_consent_revocation_wins_on_same_clock(self) -> None:
         grant = self.signed_event(

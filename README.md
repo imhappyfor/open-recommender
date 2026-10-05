@@ -1,457 +1,154 @@
 # Open Recommender
 
-Open Recommender is an early Python implementation of portable, user-controlled recommender profiles. Your recommendation taste is yours to carry across the internet.
+**Bring your preferences. Choose what to share. Keep the ability to leave.**
 
-## The Core Idea
+Open Recommender is a Python reference implementation of **ORF — Open Recommender
+Format**: portable, signed preference profiles and scoped access for websites.
+Users carry a readable `.orf` file; sites request specific signals rather than
+owning another isolated preference history.
 
-Think of your recommendation profile like a credit score — one portable, verifiable record that travels with you. Except unlike a credit score, *you own it completely*. You decide what parts are public, what stays private, and which sites get to see what.
+Sites can use those signals in their existing recommender, or send their own
+candidates to the included reranking API. The ranking algorithm is replaceable;
+the user-control and interoperability contracts are the core of the project.
 
-- **You own your data**: Your `.orf` profile lives on your device or a service of your choice.
-- **You control sharing**: Mark topics as public, selective, or private. Sites see only what you approve.
-- **You carry it forward**: Move to a new platform? Bring your preferences with you. No cold start. No algorithmic amnesia.
-- **It's auditable**: Open the file in a text editor. See exactly what's stored. No hidden data.
+## Status
 
-The repository includes:
+**Developer preview, for local demos and controlled pilots.** Not a production
+identity provider, encrypted sync service, or proven web-scale deployment.
+The Python package is 0.1.0; profile and access-contract versions are separate.
+New profiles use 0.2.0 with cross-language JCS event signatures. Existing 0.1.0
+history remains readable without changing its signatures.
+See the [wire contract](docs/protocol.md) and [architecture](docs/architecture.md).
 
-- an ORF profile model for portable preference data
-- Ed25519 keys and signed sync events
-- a FastAPI service for hosted profile sync and public profile reads
-- an API-first demo flow for instant profile-based personalization and proof-of-control
-- a site-scoped consented access flow with required and optional scopes for manually registered pilot sites
-- a localhost-only browser consent review page for pending access requests
-- a localhost-only browser trust app with a consent inbox and Local Profile Lens
-- a local CLI for creating, editing, exporting, syncing, and resolving pilot access requests
-- a CLI `feed show` command for aggregating cross-site recommendations from the local event log
-- backup and restore CLI commands for portable profile + key recovery
-- a thin partner SDK module for site-side request, exchange, verify, and projection calls
-- a browser SDK and sample React app for site-side integration in modern web apps
-- service basics: auth-route rate limiting and admin audit inspection endpoints
-- unit tests for merge rules, privacy boundaries, signatures, and hosted API flows
+A separate [Chrome-first Mac native gateway preview](docs/native-gateway.md) starts
+the local-first architecture: native approval and site-specific login keys,
+without uploading a profile. The unpacked Chrome extension and Swift native host
+are buildable without a signing team; native UI/Keychain installation still needs
+manual validation. It does not replace the hosted flow or import `.orf` yet.
 
-## What ORF means here
+There is currently no repository license. Release licensing is not yet finalized;
+do not assume permission to redistribute or integrate it as an open-source dependency.
 
-ORF stands for **Open Recommender Format**.
+## What works
 
-An ORF (Open Recommender Format) profile is a signed JSON document that keeps user preference state local and portable. The current model stores:
+- Portable JSON profiles, Ed25519 identity, signed mutations, deterministic merge.
+- Public, selective, and private topic visibility; explicit topic opt-outs.
+- Signed owner approval, denial, revocation, and hosted deletion.
+- Short-lived grant sessions for scoped projections, reranking, and site-local feedback.
+- Optional per-site backend authentication, separate from user approval and owner sync.
+- CLI, Python partner client, dependency-free browser SDK, and React demo.
+- Owner-authenticated hosted history reads, local feed aggregation, and backups with encrypted recovery keys.
 
-- profile identity derived from an Ed25519 public key
-- topic preferences with `public`, `selective`, or `private` visibility
-- topic opt-outs
-- consent flags such as `share_public_topics`, `ad_personalization`, and `hosted_sync`
-- an append-only signed event log used for sync and conflict resolution
+**The privacy boundary:** private topics stay out of partner projections, but
+registration and sync upload full readable history to your chosen service.
+Public projections omit opted-out topic names. Backups encrypt the key, not
+the profile. Revocation blocks further service access, not copies already held
+by a site. Read [Transparency & Security](docs/transparency-and-security.md).
 
-Public projections intentionally expose less than the full profile: only public topics that are not opted out, plus a limited consent view.
+## Try it locally
 
-## Quick start
+Requires Python 3.10+. From a cloned checkout:
 
-```bash
+```sh
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install -e '.[dev]'
-```
-
-Quote `.[dev]` so the shell does not treat the brackets as a glob.
-
-Create a profile:
-
-```bash
-python -m open_recommender.cli create profile.orf --display-name "Alice Example" --device-id laptop
-```
-
-Create a profile with a large randomized sample dataset:
-
-```bash
-python -m open_recommender.cli create seeded-profile.orf \
-  --display-name "Demo User" \
-  --device-id laptop \
-  --seed
-```
-
-The default seed now simulates 30 days of usage with repeated topic updates and 180 recommendation
-events, so the profile feels closer to an already-active user instead of a cold snapshot.
-
-Seed an existing profile with randomized topics, consent values, opt-outs, and recommendation
-events:
-
-```bash
-python -m open_recommender.cli seed profile.orf \
-  --seed-value 1234 \
-  --days 45 \
-  --recommendation-count 260
-```
-
-Both commands print the resolved seed value, simulated time window, and event summary so the same
-sample profile can be recreated later.
-
-Add a topic and inspect the public projection:
-
-```bash
+python -m open_recommender.cli create profile.orf --display-name "Alice" --device-id laptop
 python -m open_recommender.cli topic-set profile.orf orf:technology/python 0.9
+python -m open_recommender.cli topic-set profile.orf orf:media/podcasts 0.8 --visibility selective
 python -m open_recommender.cli export-public profile.orf
 ```
 
-**Inspect your profile** — your `.orf` file is human-readable JSON:
+On Windows, activate with `.venv\Scripts\activate`. Keep `profile.orf.key`
+private; the profile file is readable and the key controls this identity.
 
-```bash
-cat profile.orf | jq .
+Start the local service in this terminal:
+
+```sh
+python -m uvicorn open_recommender.service:create_app --factory --host 127.0.0.1
 ```
 
-You can see exactly what's stored: your identity, topics, consent flags, and the cryptographic log of all changes. See [Transparency & Security](docs/transparency-and-security.md) for details on what Open Recommender stores and what it doesn't.
+In a second terminal with the same environment activated:
 
-Create an encrypted recovery backup:
-
-```bash
-python -m open_recommender.cli backup-create profile.orf profile-backup.orfb \
-  --backup-passphrase "choose-a-strong-passphrase"
-```
-
-Restore from a backup:
-
-```bash
-python -m open_recommender.cli backup-restore profile-backup.orfb restored-profile.orf \
-  --backup-passphrase "choose-a-strong-passphrase"
-```
-
-Run the hosted API locally:
-
-```bash
-OPEN_RECOMMENDER_ADMIN_TOKEN=dev-admin-token \
-python -m uvicorn open_recommender.service:create_app --factory --reload
-```
-
-Push or pull against that API:
-
-```bash
-python -m open_recommender.cli sync-push profile.orf http://127.0.0.1:8000
-python -m open_recommender.cli sync-pull profile.orf http://127.0.0.1:8000
-```
-
-**Hosted sync (paid tier):** set `OPEN_RECOMMENDER_SYNC_TOKEN` on the server and pass
-`--sync-token <token>` to the CLI or `PartnerClient(sync_token=...)` in code. The health
-endpoint reports `sync_auth_required: true` when the gate is active.
-
-Run the narrated end-to-end pilot dry-run against a live service:
-
-```bash
+```sh
 python examples/pilot_dry_run.py http://127.0.0.1:8000
 ```
 
-Run the adopter-facing reference site example:
+The narrated dry-run creates a test profile, signs consent, exchanges a grant,
+reads its projection, syncs changes, and checks that revocation blocks the old
+session. It uses synthetic data, not your `profile.orf`.
+For authenticated Python examples, follow the [backend credential setup](docs/pilot-integration.md#backend-credentials).
+They read `ORF_SITE_TOKEN` from protected environment configuration, never browser code.
 
-```bash
-python examples/pilot_flow.py http://127.0.0.1:8000 profile.orf --auto-approve
+## See the browser demo
+
+With the local service running, in another terminal (Node.js 22.12+ required):
+
+```sh
+cd sdk/react-sample-app
+npm ci
+npm run dev
 ```
 
-Use the thin partner SDK wrapper in site code:
+Open [localhost:5173](http://localhost:5173), choose your `profile.orf` and its
+matching unencrypted `profile.orf.key`, review the sharing request, then sign in
+and rerank the sample feed. Selecting the profile uploads it to the local service;
+selecting the key imports it into this tab's memory.
 
-```python
-from open_recommender.partner_sdk import PartnerClient
+This combined user/site demo is **localhost-only**. Real sites must never ask
+users to upload their private key. The [React guide](sdk/react-sample-app/README.md)
+explains the trust boundary; [Local Profile Lens](http://127.0.0.1:8000/lens) lets
+you inspect a file before choosing whether to register it.
 
-sdk = PartnerClient("http://127.0.0.1:8000")
-created = sdk.create_access_request(
-    profile_id="<profile_id>",
-    site_id="open-news-demo",
-    purpose="Personalize the pilot site feed.",
-    required_scopes=["profile.read", "topics.public"],
-    optional_scopes=["topics.selective:orf:media/podcasts"],
-)
-```
+## Integrate a site
 
-For browser and React apps, use the ESM browser SDK in `sdk/orf-web-sdk/`:
+Keep candidate generation and your normal fallback feed. Request the smallest
+useful scope set, get the user's signed approval, and use the verified session
+to read a projection or rerank candidates. Do not read raw sync history from
+site code: it includes private data.
 
-```js
-import { ORFClient } from "@open-recommender/orf-web-sdk";
-const client = new ORFClient("http://127.0.0.1:8000");
-const result = await client.createAccessRequest({
-  profileId,
-  siteId: "open-news-demo",
-  purpose: "…",
-  requiredScopes: ["profile.read", "topics.public"],
-  optionalScopes: ["topics.selective:orf:media/podcasts"],
-});
-```
+Start with the [integration guide](docs/integration-guide.md), then use the
+[Python partner client](docs/pilot-integration.md) or
+[browser SDK](sdk/orf-web-sdk/README.md). The running API exposes route docs at
+[localhost:8000/docs](http://127.0.0.1:8000/docs).
+SDK installation is currently from this checkout, not a published npm release.
 
-Run the React demo (requires the ORF service to be running):
+## Develop and verify
 
-```bash
-cd sdk/react-sample-app && npm install && npm run dev
-# → http://localhost:5173
-```
-
-The React demo can upload a local `.orf` file from the browser and register it with the local ORF
-service directly. If you also upload the matching `.orf.key`, the browser demo can finish the
-challenge-response step locally, fetch the projection, and rerank a sample site feed without
-dropping to CLI. The private key stays in browser memory for that tab and only the signature is
-sent to the ORF service.
-
-The demo request also shows the newer scope contract: a small required baseline plus optional
-extras the user can remove without denying the whole request.
-
-If you prefer the CLI, `python -m open_recommender.cli sync-push profile.orf
-http://127.0.0.1:8000` still works too.
-
-Run the sample adopter site:
-
-```bash
-SAMPLE_SITE_DEMO_SIGNER_KEY_PATH=profile.orf.key \
-python -m uvicorn examples.sample_site:app --reload --port 9001
-```
-
-Inspect or act on a site access request:
-
-```bash
-python -m open_recommender.cli site-access-request-get <request_id> http://127.0.0.1:8000
-python -m open_recommender.cli site-access-request-approve <request_id> http://127.0.0.1:8000 --scope profile.read --scope topics.public
-python -m open_recommender.cli site-access-request-deny <request_id> http://127.0.0.1:8000 --reason "User declined this pilot request."
-```
-
-Run tests:
-
-```bash
+```sh
 python -m unittest discover -s tests -v
+cd sdk/orf-web-sdk
+npm test
+cd ../react-sample-app
+npm ci
+npm test
 ```
 
-## API surface
+The browser test builds the demo and runs headless Chromium. Shared
+[challenge vectors](tests/fixtures/signing-vectors.json) and
+[JCS event vectors](tests/fixtures/event-signing-vectors.json) are signed and
+verified in Python and JavaScript, including floating-point event metadata.
+The packaged [profile/event schema](src/open_recommender/schemas/profile.schema.json)
+checks structure, not signatures or authorization; see its
+[validation limits](docs/protocol.md#machine-readable-structure).
 
-Current FastAPI routes:
+Compare the baseline reranker with site scores using the local
+[ranking evaluation](docs/ranking-evaluation.md). Its bundled dataset is synthetic,
+not evidence of real-world recommendation quality.
 
-- `GET /health`
-- `POST /profiles`
-- `GET /profiles/{profile_id}/public`
-- `GET /profiles/{profile_id}/events?after_clock=...`
-- `POST /profiles/{profile_id}/events`
-- `POST /profiles/{profile_id}/challenges`
-- `POST /profiles/{profile_id}/challenge-response`
-- `POST /profiles/{profile_id}/site-access-requests`
-- `GET /site-access-requests/{request_id}`
-- `POST /site-access-requests/{request_id}/approve`
-- `POST /site-access-requests/{request_id}/deny`
-- `POST /site-access-requests/{request_id}/exchange`
-- `POST /site-access-requests/{request_id}/verify`
-- `GET /grant-sessions/{session_id}/projection`
-- `POST /grant-sessions/{session_id}/rank`
-- `POST /grant-sessions/{session_id}/rank/feedback`
-- `GET /consent`
-- `GET /consent/grants`
-- `GET /consent/site-access-requests/{request_id}`
-- `GET /consent/site-access-requests/{request_id}/review-data`
-- `POST /consent/grants/{grant_id}/revoke`
-- `POST /consent/site-access-requests/{request_id}/approve`
-- `POST /consent/site-access-requests/{request_id}/deny`
-- `GET /lens`
-- `GET /lens/profiles`
-- `POST /lens/profiles/import`
-- `GET /lens/profiles/{profile_id}`
-- `GET /lens/profiles/{profile_id}/pending-requests`
-- `GET /demo/site/{profile_id}`
-- `POST /demo/site/{profile_id}/challenge`
-- `POST /demo/site/{profile_id}/verify`
-- `GET /admin/pilot-sites`
-- `GET /admin/audit-events`
+## Documentation
 
-FastAPI also serves generated docs at `/docs` and `/redoc` when the app is running.
+| I want to… | Read |
+| --- | --- |
+| Create, sync, recover, revoke, or delete a profile | [Getting started](docs/getting-started.md) |
+| Understand bytes, scopes, versions, and replay rules | [Protocol](docs/protocol.md) |
+| Understand components and deployment boundaries | [Architecture](docs/architecture.md) |
+| Add a site without replacing its recommender | [Integration guide](docs/integration-guide.md) |
+| Measure the reranker against site scores | [Ranking evaluation](docs/ranking-evaluation.md) |
+| Inspect privacy and retention limits | [Transparency & Security](docs/transparency-and-security.md) |
+| Run a detailed pilot walkthrough | [Pilot integration](docs/pilot-integration.md) |
+| Explore the local cross-site feed | [Cross-site feed](docs/cross-site-feed.md) |
+| Contribute code or docs | [Contributing](CONTRIBUTING.md) |
 
-## Service configuration and guardrails
-
-The reference service reads a small set of environment variables:
-
-- `OPEN_RECOMMENDER_DB_PATH` - override the SQLite database path
-- `OPEN_RECOMMENDER_ADMIN_TOKEN` - enable the read-only admin endpoints when set
-- `OPEN_RECOMMENDER_RATE_LIMIT_WINDOW_SECONDS` - fixed-window rate-limit window for auth-sensitive routes
-- `OPEN_RECOMMENDER_RATE_LIMIT_MAX_REQUESTS` - max requests allowed per client within that window
-- `OPEN_RECOMMENDER_PILOT_SITES_PATH` - optional JSON file path for custom pilot-site registration
-
-Use a custom pilot-site file:
-
-```bash
-OPEN_RECOMMENDER_PILOT_SITES_PATH=examples/pilot-sites.json \
-python -m uvicorn open_recommender.service:create_app --factory --reload
-```
-
-Current guardrails:
-
-- auth-sensitive challenge, verify, exchange, approval, denial, and projection routes are rate-limited per client
-- admin inspection routes are disabled unless an admin token is configured
-- audit events are recorded for access requests, approvals, denials, challenge issuance and verification, grant sessions, and projection reads
-
-## Demo flow
-
-The current demo endpoints show the core product story without a browser app:
-
-1. `GET /demo/site/{profile_id}` returns immediate personalization from the profile's public topics.
-2. `POST /demo/site/{profile_id}/challenge` issues a challenge the portable profile owner can sign.
-3. `POST /demo/site/{profile_id}/verify` verifies that signature and returns a verified portable-profile session without requiring a site-specific account.
-
-## Browser trust app
-
-The browser trust app is the current localhost-only user surface for understanding one portable profile and reviewing site access.
-
-Open it in a browser:
-
-```text
-http://127.0.0.1:8000/lens
-http://127.0.0.1:8000/consent
-```
-
-Current behavior:
-
-- load a local `.orf` file directly in the browser
-- or load a profile already registered in the local service
-- inspect what stays on this device
-- inspect what is already public
-- simulate what a site could see if you approved specific scopes
-- review pending site requests from a consent inbox
-- jump from a loaded profile into any pending request tied to that profile
-- inspect active, revoked, and expired grants
-- revoke an active grant to block future exchange attempts for that grant
-
-## Site access request approval flow
-
-For the site access request flow, a site first creates a scoped access request through the service API. The ORF user can then inspect and resolve that request from the CLI:
-
-```bash
-python -m open_recommender.cli site-access-request-get <request_id> http://127.0.0.1:8000
-python -m open_recommender.cli site-access-request-approve <request_id> http://127.0.0.1:8000 --scope profile.read --scope topics.public --scope topics.selective:orf:media/podcasts
-```
-
-Or deny it explicitly:
-
-```bash
-python -m open_recommender.cli site-access-request-deny <request_id> http://127.0.0.1:8000 --reason "User declined this pilot request."
-```
-
-The service also returns a localhost-only browser review link for the same request:
-
-```text
-/consent/site-access-requests/<request_id>
-```
-
-That page is meant for local review while the service is bound to localhost. It shows the site, purpose, requested scopes, and a plain-language preview of what the site could see if approved.
-
-For pilot adopters, the repo includes `examples/pilot_flow.py`, a runnable reference integration that shows the site-side HTTP calls plus the user-side signature handoff in one file.
-
-To validate the flow in a more realistic site-shaped artifact, the repo also includes `examples/sample_site.py`, a tiny adopter app that creates requests against the ORF service and, in localhost demo mode only, can finish the proof step with a clearly-labeled demo signer key path.
-
-After approval, the site begins the exchange:
-
-```bash
-curl -X POST http://127.0.0.1:8000/site-access-requests/<request_id>/exchange
-```
-
-That response includes a `challenge_payload`. Sign that payload with the ORF private key, then verify it:
-
-```bash
-curl -X POST http://127.0.0.1:8000/site-access-requests/<request_id>/verify \
-  -H "Content-Type: application/json" \
-  -d '{
-    "challenge_id": "<challenge_id>",
-    "signature": "<ed25519-signature>"
-  }'
-```
-
-Once verification succeeds, the CLI can inspect the consented projection tied to the verified grant session:
-
-```bash
-python -m open_recommender.cli grant-session-projection <session_id> http://127.0.0.1:8000
-```
-
-Or the site can rerank its own candidate set inside that verified grant-session boundary:
-
-```bash
-curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "0.3.0",
-    "top_n": 2,
-    "include_debug": false,
-    "candidates": [
-      {
-        "candidate_id": "story-123",
-        "site_score": 0.78,
-        "candidate_topics": ["orf:media/podcasts"]
-      }
-    ]
-  }'
-```
-
-This ranking call is reranking-only: the site still owns candidate generation, and the response stays
-privacy-bounded to scores, reason codes, and optional coarse debug breakdowns rather than raw profile
-topics or topic weights.
-
-If the site wants the hosted service to remember explicit outcomes for future reranks on the same
-grant, it can also send a narrow site-local feedback record:
-
-```bash
-curl -X POST http://127.0.0.1:8000/grant-sessions/<session_id>/rank/feedback \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "0.3.0",
-    "events": [
-      {
-        "event_id": "feedback-1",
-        "event_type": "click",
-        "candidate_id": "story-123",
-        "candidate_topics": ["orf:media/podcasts"],
-        "occurred_at": "2025-01-21T10:00:00+00:00"
-      }
-    ]
-  }'
-```
-
-Current feedback types are intentionally narrow: `click`, `dismiss`, and `save`. These events stay
-service-local, scoped to the site grant, and are used only to improve later `/rank` calls for that
-same grant. `event_id` is the caller-generated dedupe key, so safe retries do not create duplicate
-feedback rows. These events do **not** mutate the portable `.orf` profile and are **not** exposed
-through projection responses.
-
-Expected behavior:
-
-- denied or expired requests cannot move into exchange
-- expired or replayed challenges are rejected
-- the consented projection includes only approved scopes: public topics plus explicitly approved selective topics
-- private topics stay out of the projection
-- auth-sensitive routes are rate-limited per client
-
-## Admin inspection surfaces
-
-When `OPEN_RECOMMENDER_ADMIN_TOKEN` is set, the reference service exposes read-only operational inspection routes:
-
-```bash
-curl -H "X-Open-Recommender-Admin-Token: dev-admin-token" \
-  http://127.0.0.1:8000/admin/pilot-sites
-
-curl -H "X-Open-Recommender-Admin-Token: dev-admin-token" \
-  "http://127.0.0.1:8000/admin/audit-events?limit=20"
-```
-
-These endpoints are meant for local and pilot investigation, not end-user access.
-
-## Cross-site feed
-
-If RECOMMEND events have been pushed to the local profile from multiple sites, the CLI can aggregate them into a ranked feed:
-
-```bash
-python -m open_recommender.cli feed show profile.orf
-python -m open_recommender.cli feed show profile.orf --top-n 10
-```
-
-The feed is computed locally from the profile's event log. It de-duplicates items recommended by multiple sites and ranks them by consensus (how many sites agree), freshness, and topic affinity. See [Cross-site feed](docs/cross-site-feed.md) for details.
-
-## Repository layout
-
-```text
-src/open_recommender/   Core package, CLI, models, API, and SQLite store
-sdk/                    Browser SDK and sample React app for adopter integration
-tests/                  unittest coverage for models and service flows
-docs/                   Deeper contributor and architecture documentation
-examples/               Reference flows and pilot examples
-```
-
-## Read more
-
-- [Getting started](docs/getting-started.md)
-- [Local proof-of-concept testing](docs/local-poc-testing.md)
-- [Pilot integration flow](docs/pilot-integration.md)
-- [Architecture](docs/architecture.md)
-- [Cross-site feed](docs/cross-site-feed.md)
-- [Integration guide](docs/integration-guide.md)
-- [Transparency and security](docs/transparency-and-security.md)
-- [Contributing](CONTRIBUTING.md)
+Core code lives in `src/open_recommender/`; browser packages in `sdk/`;
+runnable site integrations in `examples/`; regression tests in `tests/`.

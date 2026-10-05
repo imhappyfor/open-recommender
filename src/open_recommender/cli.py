@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import random
 import sys
 from datetime import datetime, timedelta, timezone
@@ -13,14 +14,18 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .crypto import (
+    canonical_signed_json,
     generate_key_pair,
     load_private_key,
     load_private_key_bytes,
+    load_json,
     private_key_public_key_b64,
     save_private_key,
     sign_payload,
+    verify_signature,
+    write_private_file,
 )
-from .models import EventOp, ORFProfile, build_signed_event
+from .models import EventOp, ORFProfile, build_registration_event, build_signed_event
 from .seed_catalog import SEED_SITES, SEED_TOPICS
 
 
@@ -36,11 +41,12 @@ if len(SEED_TOPICS) < DEFAULT_SEED_TOPIC_COUNT:
 
 
 def load_profile(path: str | Path) -> ORFProfile:
-    return ORFProfile.from_document(json.loads(Path(path).read_text(encoding="utf-8")))
+    return ORFProfile.from_document(load_json(Path(path).read_text(encoding="utf-8")))
 
 
-def save_profile(path: str | Path, profile: ORFProfile) -> None:
-    Path(path).write_text(json.dumps(profile.to_document(), indent=2, sort_keys=True), encoding="utf-8")
+def save_profile(path: str | Path, profile: ORFProfile, *, overwrite: bool = True) -> None:
+    write_private_file(path, json.dumps(profile.to_document(), indent=2, sort_keys=True, allow_nan=False).encode("utf-8"),
+        overwrite=overwrite)
 
 
 def private_key_path_for_profile(profile_path: Path, provided_path: str | None) -> Path:
@@ -49,19 +55,53 @@ def private_key_path_for_profile(profile_path: Path, provided_path: str | None) 
     return profile_path.with_suffix(profile_path.suffix + ".key")
 
 
-def send_json(method: str, url: str, body: dict | None = None) -> dict:
+def send_json(
+    method: str, url: str, body: dict | None = None, *, extra_headers: dict[str, str] | None = None
+) -> dict:
     data = None
     headers = {"Accept": "application/json"}
+    headers.update(extra_headers or {})
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = request.Request(url, data=data, method=method, headers=headers)
     with request.urlopen(req) as response:
-        return json.loads(response.read().decode("utf-8"))
+        return load_json(response.read())
 
 
 def print_json(payload: dict) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _sync_send(args: argparse.Namespace, method: str, url: str, body: dict) -> dict:
+    token = args.sync_token or os.getenv("OPEN_RECOMMENDER_SYNC_TOKEN")
+    if token:
+        return send_json(method, url, body, extra_headers={"Authorization": f"Bearer {token}"})
+    return send_json(method, url, body)
+
+
+def signed_owner_payload(
+    server: str, profile_id: str, action: str, target_id: str, parameters: dict,
+    private_key: Ed25519PrivateKey, *, sender=None,
+) -> dict:
+    challenge = (sender or send_json)(
+        "POST", f"{server.rstrip('/')}/profiles/{profile_id}/owner-action-challenges",
+        {"action": action, "target_id": target_id, "parameters": parameters},
+    )["challenge_payload"]
+    return {**parameters, "owner_proof": {
+        "challenge_id": challenge["challenge_id"],
+        "signature": sign_payload(challenge, private_key),
+    }}
+
+
+def _signed_cli_action(args: argparse.Namespace, action: str, target_id: str, parameters: dict) -> dict:
+    profile = load_profile(args.profile_path)
+    private_key = load_private_key(
+        private_key_path_for_profile(Path(args.profile_path), args.key_path), args.key_passphrase
+    )
+    if private_key_public_key_b64(private_key) != profile.public_key:
+        raise ValueError("The provided key does not match the profile public key.")
+    return signed_owner_payload(args.server, profile.profile_id, action, target_id, parameters, private_key)
 
 
 def _apply_signed_event(
@@ -347,6 +387,11 @@ def seed_profile(
 def command_create(args: argparse.Namespace) -> int:
     profile_path = Path(args.profile_path)
     key_path = private_key_path_for_profile(profile_path, args.key_path)
+    if profile_path.resolve() == key_path.resolve():
+        raise ValueError("Profile and key destinations must be different files.")
+    for path in (profile_path, key_path):
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"Refusing to overwrite existing file: {path}")
     private_key, public_key = generate_key_pair()
     profile = ORFProfile.create(
         display_name=args.display_name,
@@ -363,8 +408,11 @@ def command_create(args: argparse.Namespace) -> int:
             recommendation_count=args.recommendation_count,
             days=args.days,
         )
-    save_profile(profile_path, profile)
-    save_private_key(key_path, private_key, passphrase=args.passphrase)
+    registration = build_registration_event(profile)
+    registration.signature = sign_payload(registration.unsigned_payload(), private_key)
+    profile.apply_event(registration)
+    save_private_key(key_path, private_key, passphrase=args.passphrase, overwrite=False)
+    save_profile(profile_path, profile, overwrite=False)
     payload = {
         "profile_path": str(profile_path),
         "key_path": str(key_path),
@@ -436,8 +484,18 @@ def command_export_public(args: argparse.Namespace) -> int:
 
 def command_sync_push(args: argparse.Namespace) -> int:
     profile = load_profile(args.profile_path)
+    if not any(event.clock == 0 for event in profile.event_log):
+        private_key = load_private_key(
+            private_key_path_for_profile(Path(args.profile_path), args.key_path), args.key_passphrase
+        )
+        if private_key_public_key_b64(private_key) != profile.public_key:
+            raise ValueError("The provided key does not match the profile public key.")
+        registration = build_registration_event(profile)
+        registration.signature = sign_payload(registration.unsigned_payload(), private_key)
+        profile.apply_event(registration)
+        save_profile(args.profile_path, profile)
     send_json("POST", f"{args.server.rstrip('/')}/profiles", {"profile": profile.to_document()})
-    send_json(
+    _sync_send(args,
         "POST",
         f"{args.server.rstrip('/')}/profiles/{profile.profile_id}/events",
         {"events": [event.to_dict() for event in profile.event_log]},
@@ -448,17 +506,27 @@ def command_sync_push(args: argparse.Namespace) -> int:
 def command_sync_pull(args: argparse.Namespace) -> int:
     profile_path = Path(args.profile_path)
     profile = load_profile(profile_path)
-    after_clock = max(profile.sync.last_clock - 1, 0)
-    payload = send_json(
-        "GET",
-        f"{args.server.rstrip('/')}/profiles/{profile.profile_id}/events?after_clock={after_clock}",
+    # ponytail: fetch full post-registration history; use a server sequence cursor when bandwidth matters.
+    payload = _sync_send(args,
+        "POST", f"{args.server.rstrip('/')}/profiles/{profile.profile_id}/events/read",
+        _signed_cli_action(args, "sync-read", profile.profile_id, {"after_clock": 0}),
     )
-    known_event_ids = {event.event_id for event in profile.event_log}
+    events = {event.event_id: event for event in profile.event_log}
     for event_data in payload["events"]:
-        if event_data["event_id"] in known_event_ids:
+        event = build_event_from_remote(event_data)
+        verify_signature(event.unsigned_payload(), event.signature, profile.public_key)
+        if event.profile_id != profile.profile_id or event.clock <= 0:
+            raise ValueError("Sync events must match the profile and have a positive clock.")
+        existing = events.get(event.event_id)
+        if existing is not None:
+            if canonical_signed_json(existing.unsigned_payload()) != canonical_signed_json(event.unsigned_payload()):
+                raise ValueError("Event ID is already used for a different event.")
             continue
-        profile.apply_event(build_event_from_remote(event_data))
-    save_profile(profile_path, profile)
+        events[event.event_id] = event
+    profile.event_log = list(events.values())
+    rebuilt = profile.rebuild_from_verified_history()
+    rebuilt.sync.device_id = profile.sync.device_id
+    save_profile(profile_path, rebuilt)
     return 0
 
 
@@ -479,6 +547,7 @@ def command_site_access_request_approve(args: argparse.Namespace) -> int:
         payload["approved_scopes"] = args.scope
     if args.grant_expires_at is not None:
         payload["grant_expires_at"] = args.grant_expires_at
+    payload = _signed_cli_action(args, "approve", args.request_id, payload)
     print_json(send_json("POST", f"{args.server.rstrip('/')}/site-access-requests/{args.request_id}/approve", payload))
     return 0
 
@@ -487,7 +556,26 @@ def command_site_access_request_deny(args: argparse.Namespace) -> int:
     payload: dict[str, object] = {"actor": args.actor}
     if args.reason is not None:
         payload["reason"] = args.reason
+    payload = _signed_cli_action(args, "deny", args.request_id, payload)
     print_json(send_json("POST", f"{args.server.rstrip('/')}/site-access-requests/{args.request_id}/deny", payload))
+    return 0
+
+
+def command_site_grant_revoke(args: argparse.Namespace) -> int:
+    parameters = {"actor": args.actor}
+    if args.reason is not None:
+        parameters["reason"] = args.reason
+    payload = _signed_cli_action(args, "revoke", args.grant_id, parameters)
+    print_json(send_json("POST", f"{args.server.rstrip('/')}/grants/{args.grant_id}/revoke", payload))
+    return 0
+
+
+def command_profile_delete(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        raise ValueError("Hosted deletion is irreversible. Pass --confirm to delete hosted rows; local files remain intact.")
+    profile_id = load_profile(args.profile_path).profile_id
+    payload = _signed_cli_action(args, "delete", profile_id, {})
+    print_json(send_json("POST", f"{args.server.rstrip('/')}/profiles/{profile_id}/delete", payload))
     return 0
 
 
@@ -504,7 +592,7 @@ def command_backup_create(args: argparse.Namespace) -> int:
     profile_path = Path(args.profile_path)
     key_path = private_key_path_for_profile(profile_path, args.key_path)
     private_key = load_private_key(key_path, passphrase=args.key_passphrase)
-    profile_doc = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile_doc = load_json(profile_path.read_text(encoding="utf-8"))
     profile = ORFProfile.from_document(profile_doc)
 
     if private_key_public_key_b64(private_key) != profile.public_key:
@@ -528,7 +616,8 @@ def command_backup_create(args: argparse.Namespace) -> int:
         },
     }
     backup_path = Path(args.backup_path)
-    backup_path.write_text(json.dumps(backup_doc, indent=2, sort_keys=True), encoding="utf-8")
+    write_private_file(backup_path, json.dumps(backup_doc, indent=2, sort_keys=True, allow_nan=False).encode("utf-8"),
+        overwrite=False)
     print_json(
         {
             "backup_path": str(backup_path),
@@ -541,7 +630,7 @@ def command_backup_create(args: argparse.Namespace) -> int:
 
 def command_backup_restore(args: argparse.Namespace) -> int:
     backup_path = Path(args.backup_path)
-    backup_doc = json.loads(backup_path.read_text(encoding="utf-8"))
+    backup_doc = load_json(backup_path.read_text(encoding="utf-8"))
     if backup_doc.get("backup_schema") != "orf-backup.v1":
         raise ValueError("Unsupported backup schema.")
 
@@ -564,12 +653,17 @@ def command_backup_restore(args: argparse.Namespace) -> int:
 
     profile_path = Path(args.profile_path)
     key_path = Path(args.key_path) if args.key_path else _default_backup_key_path(profile_path)
+    if len({path.resolve() for path in (backup_path, profile_path, key_path)}) != 3:
+        raise ValueError("Backup source, profile destination, and key destination must be different files.")
     for path in (profile_path, key_path):
+        if path.is_symlink():
+            raise ValueError(f"Refusing to save through a symbolic link: {path}")
         if path.exists() and not args.overwrite:
             raise ValueError(f"Refusing to overwrite existing file: {path}")
 
-    profile_path.write_text(json.dumps(profile_doc, indent=2, sort_keys=True), encoding="utf-8")
-    key_path.write_bytes(key_bytes)
+    profile_bytes = json.dumps(profile_doc, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
+    write_private_file(key_path, key_bytes, overwrite=args.overwrite)
+    write_private_file(profile_path, profile_bytes, overwrite=args.overwrite)
     print_json(
         {
             "profile_path": str(profile_path),
@@ -741,11 +835,17 @@ def build_parser() -> argparse.ArgumentParser:
     push_parser = subparsers.add_parser("sync-push")
     push_parser.add_argument("profile_path")
     push_parser.add_argument("server")
+    push_parser.add_argument("--key-path")
+    push_parser.add_argument("--key-passphrase")
+    push_parser.add_argument("--sync-token", help="Optional shared gate; defaults to OPEN_RECOMMENDER_SYNC_TOKEN.")
     push_parser.set_defaults(func=command_sync_push)
 
     pull_parser = subparsers.add_parser("sync-pull")
     pull_parser.add_argument("profile_path")
     pull_parser.add_argument("server")
+    pull_parser.add_argument("--key-path")
+    pull_parser.add_argument("--key-passphrase")
+    pull_parser.add_argument("--sync-token", help="Optional shared gate; defaults to OPEN_RECOMMENDER_SYNC_TOKEN.")
     pull_parser.set_defaults(func=command_sync_pull)
 
     site_request_get_parser = subparsers.add_parser("site-access-request-get")
@@ -767,6 +867,25 @@ def build_parser() -> argparse.ArgumentParser:
     site_request_deny_parser.add_argument("--reason")
     site_request_deny_parser.add_argument("--actor", default="cli")
     site_request_deny_parser.set_defaults(func=command_site_access_request_deny)
+
+    revoke_parser = subparsers.add_parser("site-grant-revoke")
+    revoke_parser.add_argument("grant_id")
+    revoke_parser.add_argument("server")
+    revoke_parser.add_argument("--reason")
+    revoke_parser.add_argument("--actor", default="cli")
+    revoke_parser.set_defaults(func=command_site_grant_revoke)
+
+    delete_parser = subparsers.add_parser("profile-delete")
+    delete_parser.add_argument("profile_path")
+    delete_parser.add_argument("server")
+    delete_parser.add_argument("--confirm", action="store_true")
+    delete_parser.set_defaults(func=command_profile_delete)
+
+    for owner_parser in (site_request_approve_parser, site_request_deny_parser, revoke_parser, delete_parser):
+        if owner_parser is not delete_parser:
+            owner_parser.add_argument("--profile-path", required=True)
+        owner_parser.add_argument("--key-path")
+        owner_parser.add_argument("--key-passphrase")
 
     grant_session_projection_parser = subparsers.add_parser("grant-session-projection")
     grant_session_projection_parser.add_argument("session_id")
@@ -809,7 +928,7 @@ def main(argv: list[str] | None = None) -> int:
         detail = exc.read().decode("utf-8")
         print(detail or str(exc), file=sys.stderr)
         return 1
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

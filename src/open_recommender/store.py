@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -9,16 +11,14 @@ from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 
-from .crypto import verify_signature
+from .crypto import canonical_json, canonical_signed_json, verify_signature
 from .models import (
     AccessGrant,
     AccessRequestStatus,
-    ConsentSettings,
     GrantSession,
     ORFProfile,
     SignedEvent,
     SiteAccessRequest,
-    SyncState,
     ensure_supported_schema_version,
     normalize_request_scope_sets,
     normalize_scope_set,
@@ -49,15 +49,28 @@ DEFAULT_PILOT_SITES = (
 )
 
 
+class ResourceLimitExceeded(Exception):
+    """A configured service budget was exceeded; never truncate user history."""
+
+
 class SQLiteStore:
     def __init__(
         self,
         db_path: str | Path,
         *,
         pilot_sites: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        max_profile_events: int = 10_000,
+        max_grant_feedback_events: int = 10_000,
+        max_history_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         self.db_path = str(db_path)
         self.pilot_sites = tuple(pilot_sites or DEFAULT_PILOT_SITES)
+        for value in (max_profile_events, max_grant_feedback_events, max_history_bytes):
+            if type(value) is not int or value <= 0:
+                raise ValueError("Store limits must be positive integers.")
+        self.max_profile_events = max_profile_events
+        self.max_grant_feedback_events = max_grant_feedback_events
+        self.max_history_bytes = max_history_bytes
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -635,15 +648,18 @@ class SQLiteStore:
             )
         return approved_request
 
-    def get_access_request(self, request_id: str) -> tuple[str, SiteAccessRequest]:
-        with self._connect() as connection:
+    def get_access_request(
+        self, request_id: str, *, connection: sqlite3.Connection | None = None,
+        site_id: str | None = None,
+    ) -> tuple[str, SiteAccessRequest]:
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             row = connection.execute(
                 """
                 SELECT profile_id, request_json, status, expires_at
                 FROM access_requests
-                WHERE request_id = ?
+                WHERE request_id = ? AND (? IS NULL OR site_id = ?)
                 """,
-                (request_id,),
+                (request_id, site_id, site_id),
             ).fetchone()
             if row is None:
                 raise KeyError("Unknown access request.")
@@ -757,8 +773,9 @@ class SQLiteStore:
         *,
         actor: str = "cli",
         reason: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> AccessGrant:
-        with self._connect() as connection:
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             row = connection.execute(
                 """
                 SELECT grant_id, request_id, profile_id, site_id, grant_json
@@ -826,14 +843,17 @@ class SQLiteStore:
         approved_scopes: list[str] | tuple[str, ...] | None = None,
         grant_expires_at: str | None = None,
         actor: str = "cli",
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[SiteAccessRequest, AccessGrant]:
-        profile_id, request = self.get_access_request(request_id)
+        profile_id, request = self.get_access_request(request_id, connection=connection)
         if request.status != AccessRequestStatus.PENDING:
             raise ValueError("Only pending requests can be approved.")
 
         site = self._site_record(request.site_id)
         requested_scope_set = set(request.requested_scopes)
-        normalized_scopes, ignored_scopes = normalize_scope_set(approved_scopes or request.requested_scopes)
+        normalized_scopes, ignored_scopes = normalize_scope_set(
+            request.requested_scopes if approved_scopes is None else approved_scopes
+        )
         if not normalized_scopes:
             raise ValueError("At least one approved scope is required.")
         if not set(normalized_scopes).issubset(requested_scope_set):
@@ -859,7 +879,7 @@ class SQLiteStore:
         request.extra_fields["decided_at"] = grant.issued_at
         request.extra_fields["decision_actor"] = actor
 
-        with self._connect() as connection:
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             connection.execute(
                 """
                 UPDATE access_requests
@@ -900,9 +920,10 @@ class SQLiteStore:
         return request, grant
 
     def deny_access_request(
-        self, request_id: str, *, reason: str | None = None, actor: str = "cli"
+        self, request_id: str, *, reason: str | None = None, actor: str = "cli",
+        connection: sqlite3.Connection | None = None,
     ) -> SiteAccessRequest:
-        profile_id, request = self.get_access_request(request_id)
+        profile_id, request = self.get_access_request(request_id, connection=connection)
         if request.status != AccessRequestStatus.PENDING:
             raise ValueError("Only pending requests can be denied.")
 
@@ -912,7 +933,7 @@ class SQLiteStore:
         if reason:
             request.extra_fields["denial_reason"] = reason
 
-        with self._connect() as connection:
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             connection.execute(
                 """
                 UPDATE access_requests
@@ -935,6 +956,101 @@ class SQLiteStore:
                 payload={"reason": reason, "actor": actor},
             )
         return request
+
+    def _owner_action_type(self, action: str, target_id: str, parameters: dict[str, Any]) -> str:
+        fields = {
+            "approve": {"approved_scopes", "grant_expires_at", "actor"},
+            "deny": {"reason", "actor"},
+            "revoke": {"reason", "actor"},
+            "delete": set(),
+            "sync-read": {"after_clock"},
+        }
+        if action not in fields or not isinstance(parameters, dict):
+            raise ValueError("Unknown owner action or invalid parameters.")
+        if set(parameters) - fields[action]:
+            raise ValueError("Unknown owner action parameters.")
+        if action == "sync-read":
+            clock = parameters.get("after_clock")
+            if type(clock) is not int or not 0 <= clock <= 2**53 - 1:
+                raise ValueError("after_clock must be a non-negative safe integer.")
+        if "approved_scopes" in parameters:
+            scopes = parameters["approved_scopes"]
+            if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+                raise ValueError("approved_scopes must be an array of strings.")
+        for name in ("reason", "actor", "grant_expires_at"):
+            if name in parameters and not isinstance(parameters[name], str) and parameters[name] is not None:
+                raise ValueError(f"{name} must be a string.")
+        if "actor" in parameters and not parameters["actor"]:
+            raise ValueError("actor must be a non-empty string.")
+        if parameters.get("grant_expires_at") is not None:
+            self._parse_timestamp(parameters["grant_expires_at"])
+        digest = hashlib.sha256(canonical_json({
+            "action": action, "target_id": target_id, "parameters": parameters,
+        })).hexdigest()
+        return f"owner-{action}:{digest}"
+
+    def _owner_target_profile(self, connection: sqlite3.Connection, action: str, target_id: str) -> str:
+        table, field = {
+            "approve": ("access_requests", "request_id"),
+            "deny": ("access_requests", "request_id"),
+            "revoke": ("grants", "grant_id"),
+            "delete": ("profiles", "profile_id"),
+            "sync-read": ("profiles", "profile_id"),
+        }[action]
+        row = connection.execute(
+            f"SELECT profile_id FROM {table} WHERE {field} = ?", (target_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError("Unknown owner action target.")
+        return str(row["profile_id"])
+
+    def create_owner_action_challenge(
+        self, profile_id: str, action: str, target_id: str, parameters: dict[str, Any]
+    ) -> dict[str, str]:
+        challenge_type = self._owner_action_type(action, target_id, parameters)
+        with self._connect() as connection:
+            if self._owner_target_profile(connection, action, target_id) != profile_id:
+                raise ValueError("Target does not belong to this profile.")
+        return self.create_challenge(
+            profile_id, challenge_type=challenge_type,
+            request_id=target_id if action in {"approve", "deny"} else None,
+            grant_id=target_id if action == "revoke" else None,
+        )
+
+    def perform_owner_action(
+        self, action: str, target_id: str, parameters: dict[str, Any], proof: dict[str, Any]
+    ) -> Any:
+        challenge_type = self._owner_action_type(action, target_id, parameters)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            profile_id = self._owner_target_profile(connection, action, target_id)
+            try:
+                self._verify_challenge_response(
+                    connection, profile_id, str(proof["challenge_id"]), str(proof["signature"]),
+                    challenge_type=challenge_type,
+                )
+            except (KeyError, ValueError, InvalidSignature) as error:
+                raise PermissionError(f"Owner proof is invalid: {error}") from error
+            if action == "approve":
+                return self.approve_access_request(target_id, connection=connection, **parameters)
+            if action == "deny":
+                return self.deny_access_request(target_id, connection=connection, **parameters)
+            if action == "revoke":
+                return self.revoke_grant(target_id, connection=connection, **parameters)
+            if action == "sync-read":
+                events = self.list_events(profile_id, parameters["after_clock"], connection=connection)
+                self._write_audit_event(connection, "sync.read", profile_id=profile_id,
+                    payload={"after_clock": parameters["after_clock"], "event_count": len(events)})
+                return {"profile_id": profile_id, "events": events}
+            removed = {}
+            for table in (
+                "ranking_feedback_events", "grant_sessions", "grants", "access_requests",
+                "challenges", "audit_events", "events", "profiles",
+            ):
+                removed[table] = connection.execute(
+                    f"DELETE FROM {table} WHERE profile_id = ?", (profile_id,)
+                ).rowcount
+            return {"profile_id": profile_id, "deleted": True, "removed_rows": removed}
 
     def begin_grant_exchange(self, request_id: str) -> tuple[SiteAccessRequest, AccessGrant, dict[str, str]]:
         profile_id, request = self.get_access_request(request_id)
@@ -1014,14 +1130,23 @@ class SQLiteStore:
             )
         return grant, session
 
-    def get_grant_session(self, session_id: str) -> GrantSession:
+    def get_grant_session(self, session_id: str, *, site_id: str | None = None) -> GrantSession:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT session_json FROM grant_sessions WHERE session_id = ?",
-                (session_id,),
+                """
+                SELECT grant_sessions.session_json, grants.grant_json
+                FROM grant_sessions JOIN grants USING (grant_id)
+                WHERE session_id = ? AND (? IS NULL OR grant_sessions.site_id = ?)
+                """,
+                (session_id, site_id, site_id),
             ).fetchone()
         if row is None:
             raise KeyError("Unknown grant session.")
+        grant = AccessGrant.from_dict(json.loads(row["grant_json"]))
+        if grant.extra_fields.get("revoked_at") is not None:
+            raise ValueError("Grant has been revoked.")
+        if self._is_expired(grant.expires_at):
+            raise ValueError("Grant has expired.")
         session = GrantSession.from_dict(json.loads(row["session_json"]))
         if self._is_expired(session.expires_at):
             raise ValueError("Grant session has expired.")
@@ -1114,7 +1239,15 @@ class SQLiteStore:
         accepted_events = 0
         accepted_feedback_types: set[str] = set()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            totals = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(event_json AS BLOB))), 0) "
+                "FROM ranking_feedback_events WHERE grant_id = ?",
+                (session.grant_id,),
+            ).fetchone()
+            event_count, history_bytes = totals
             for event in feedback_request.events:
+                event_json = json.dumps(event.to_dict(), sort_keys=True)
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO ranking_feedback_events (
@@ -1131,12 +1264,16 @@ class SQLiteStore:
                         session.site_id,
                         event.candidate_id,
                         event.event_type.value,
-                        json.dumps(event.to_dict(), sort_keys=True),
+                        event_json,
                         event.occurred_at,
                         ingested_at,
                     ),
                 )
                 if cursor.rowcount:
+                    event_count += 1
+                    history_bytes += len(event_json)  # Stored JSON is ASCII escaped, so characters equal bytes.
+                    if event_count > self.max_grant_feedback_events or history_bytes > self.max_history_bytes:
+                        raise ResourceLimitExceeded("Grant feedback history exceeds the configured count or byte limit.")
                     accepted_events += 1
                     accepted_feedback_types.add(event.event_type.value)
 
@@ -1176,29 +1313,6 @@ class SQLiteStore:
             for row in rows
         )
 
-    def _verified_profile(self, profile: ORFProfile) -> ORFProfile:
-        if not profile.event_log:
-            return profile
-
-        rebuilt = ORFProfile(
-            schema_version=profile.schema_version,
-            profile_id=profile.profile_id,
-            display_name=profile.display_name,
-            public_key=profile.public_key,
-            created_at=profile.created_at,
-            updated_at=profile.created_at,
-            consent=ConsentSettings(),
-            sync=SyncState(device_id=profile.sync.device_id),
-            event_log=[],
-        )
-        for event in sorted(
-            profile.event_log,
-            key=lambda item: (item.clock, item.timestamp, item.event_id),
-        ):
-            verify_signature(event.unsigned_payload(), event.signature, profile.public_key)
-            rebuilt.apply_event(event)
-        return rebuilt
-
     def get_profile(self, profile_id: str) -> ORFProfile | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -1217,16 +1331,18 @@ class SQLiteStore:
         return [ORFProfile.from_document(json.loads(row["document_json"])) for row in rows]
 
     def save_profile(self, profile: ORFProfile) -> ORFProfile:
-        profile = self._verified_profile(profile)
-        document = json.dumps(profile.to_document(), sort_keys=True)
+        if not profile.event_log:
+            raise ValueError("Profile registration requires signed events.")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT public_key FROM profiles WHERE profile_id = ?",
                 (profile.profile_id,),
             ).fetchone()
             if existing is not None and existing["public_key"] != profile.public_key:
                 raise ValueError("Profile ID is already registered with a different public key.")
-
+            profile = self._merge_events(connection, profile, profile.event_log)
+            document = json.dumps(profile.to_document(), sort_keys=True)
             connection.execute(
                 """
                 INSERT INTO profiles (profile_id, public_key, display_name, document_json, created_at, updated_at)
@@ -1245,44 +1361,57 @@ class SQLiteStore:
                     profile.updated_at,
                 ),
             )
-            for event in profile.event_log:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO events (event_id, profile_id, clock, timestamp, event_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event.event_id,
-                        profile.profile_id,
-                        event.clock,
-                        event.timestamp,
-                        json.dumps(event.to_dict(), sort_keys=True),
-                    ),
-                )
         return profile
 
-    def append_events(self, profile_id: str, events: list[SignedEvent]) -> ORFProfile:
-        profile = self.get_profile(profile_id)
-        if profile is None:
-            raise KeyError(f"Unknown profile: {profile_id}")
+    def _merge_events(
+        self, connection: sqlite3.Connection, profile: ORFProfile, events: list[SignedEvent]
+    ) -> ORFProfile:
+        rows = connection.execute(
+            "SELECT event_id, event_json FROM events WHERE profile_id = ?", (profile.profile_id,),
+        ).fetchall()
+        history_bytes = sum(len(row["event_json"].encode("utf-8")) for row in rows)
+        stored = {
+            row["event_id"]: SignedEvent.from_dict(json.loads(row["event_json"]))
+            for row in rows
+        }
+        for event in events:
+            verify_signature(event.unsigned_payload(), event.signature, profile.public_key)
+            if event.profile_id != profile.profile_id or event.clock < 0:
+                raise ValueError("Event must match the profile and have a non-negative clock.")
+            existing = stored.get(event.event_id)
+            if existing is not None:
+                if canonical_signed_json(existing.unsigned_payload()) != canonical_signed_json(event.unsigned_payload()):
+                    raise ValueError("Event ID is already used for a different event.")
+                continue
+            event_json = json.dumps(event.to_dict(), sort_keys=True)
+            if len(stored) >= self.max_profile_events or history_bytes + len(event_json) > self.max_history_bytes:
+                raise ResourceLimitExceeded("Profile history exceeds the configured count or byte limit.")
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO events (event_id, profile_id, clock, timestamp, event_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    event.event_id, profile.profile_id, event.clock, event.timestamp,
+                    event_json,
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise ValueError("Event ID is already used for a different profile.")
+            stored[event.event_id] = event
+            history_bytes += len(event_json)
+        profile.event_log = list(stored.values())
+        return profile.rebuild_from_verified_history()
 
+    def append_events(self, profile_id: str, events: list[SignedEvent]) -> ORFProfile:
         with self._connect() as connection:
-            for event in events:
-                verify_signature(event.unsigned_payload(), event.signature, profile.public_key)
-                profile.apply_event(event)
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO events (event_id, profile_id, clock, timestamp, event_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event.event_id,
-                        profile.profile_id,
-                        event.clock,
-                        event.timestamp,
-                        json.dumps(event.to_dict(), sort_keys=True),
-                    ),
-                )
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT document_json FROM profiles WHERE profile_id = ?", (profile_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown profile: {profile_id}")
+            profile = self._merge_events(
+                connection, ORFProfile.from_document(json.loads(row["document_json"])), events
+            )
             connection.execute(
                 """
                 UPDATE profiles
@@ -1298,8 +1427,10 @@ class SQLiteStore:
             )
         return profile
 
-    def list_events(self, profile_id: str, after_clock: int = 0) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+    def list_events(
+        self, profile_id: str, after_clock: int = 0, *, connection: sqlite3.Connection | None = None
+    ) -> list[dict[str, Any]]:
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             rows = connection.execute(
                 """
                 SELECT event_json
@@ -1380,61 +1511,80 @@ class SQLiteStore:
         grant_id: str | None = None,
         challenge_type: str | None = None,
     ) -> bool:
-        profile = self.get_profile(profile_id)
-        if profile is None:
-            raise KeyError(f"Unknown profile: {profile_id}")
-
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT challenge_id, profile_id, nonce, created_at, used, request_id, site_id, grant_id, challenge_type
-                FROM challenges
-                WHERE challenge_id = ? AND profile_id = ?
-                """,
-                (challenge_id, profile_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError("Unknown challenge.")
-            if row["used"]:
-                raise ValueError("Challenge has already been used.")
-            if self._challenge_expired(str(row["created_at"])):
-                raise ValueError("Challenge has expired.")
-            if request_id is not None and row["request_id"] != request_id:
-                raise ValueError("Challenge is not bound to this access request.")
-            if site_id is not None and row["site_id"] != site_id:
-                raise ValueError("Challenge is not bound to this site.")
-            if grant_id is not None and row["grant_id"] != grant_id:
-                raise ValueError("Challenge is not bound to this grant.")
-            if challenge_type is not None and row["challenge_type"] != challenge_type:
-                raise ValueError("Challenge type does not match.")
+            connection.execute("BEGIN IMMEDIATE")
+            return self._verify_challenge_response(
+                connection, profile_id, challenge_id, signature, request_id=request_id,
+                site_id=site_id, grant_id=grant_id, challenge_type=challenge_type,
+            )
 
-            payload = {
-                "challenge_id": row["challenge_id"],
-                "profile_id": row["profile_id"],
-                "nonce": row["nonce"],
-                "created_at": row["created_at"],
-            }
-            if row["request_id"] is not None:
-                payload["request_id"] = row["request_id"]
-            if row["site_id"] is not None:
-                payload["site_id"] = row["site_id"]
-            if row["grant_id"] is not None:
-                payload["grant_id"] = row["grant_id"]
-            if row["challenge_type"] != "profile":
-                payload["challenge_type"] = row["challenge_type"]
-            verify_signature(payload, signature, profile.public_key)
-            connection.execute(
-                "UPDATE challenges SET used = 1 WHERE challenge_id = ?",
-                (challenge_id,),
-            )
-            self._write_audit_event(
-                connection,
-                "challenge.verified",
-                profile_id=profile_id,
-                site_id=row["site_id"],
-                request_id=row["request_id"],
-                grant_id=row["grant_id"],
-                challenge_id=challenge_id,
-                payload={"challenge_type": row["challenge_type"]},
-            )
+    def _verify_challenge_response(
+        self,
+        connection: sqlite3.Connection,
+        profile_id: str,
+        challenge_id: str,
+        signature: str,
+        *,
+        request_id: str | None = None,
+        site_id: str | None = None,
+        grant_id: str | None = None,
+        challenge_type: str | None = None,
+    ) -> bool:
+        profile_row = connection.execute(
+            "SELECT public_key FROM profiles WHERE profile_id = ?", (profile_id,)
+        ).fetchone()
+        if profile_row is None:
+            raise KeyError(f"Unknown profile: {profile_id}")
+        row = connection.execute(
+            """
+            SELECT challenge_id, profile_id, nonce, created_at, used, request_id, site_id, grant_id, challenge_type
+            FROM challenges
+            WHERE challenge_id = ? AND profile_id = ?
+            """,
+            (challenge_id, profile_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError("Unknown challenge.")
+        if row["used"]:
+            raise ValueError("Challenge has already been used.")
+        if self._challenge_expired(str(row["created_at"])):
+            raise ValueError("Challenge has expired.")
+        if request_id is not None and row["request_id"] != request_id:
+            raise ValueError("Challenge is not bound to this access request.")
+        if site_id is not None and row["site_id"] != site_id:
+            raise ValueError("Challenge is not bound to this site.")
+        if grant_id is not None and row["grant_id"] != grant_id:
+            raise ValueError("Challenge is not bound to this grant.")
+        if challenge_type is not None and row["challenge_type"] != challenge_type:
+            raise ValueError("Challenge type does not match.")
+
+        payload = {
+            "challenge_id": row["challenge_id"],
+            "profile_id": row["profile_id"],
+            "nonce": row["nonce"],
+            "created_at": row["created_at"],
+        }
+        if row["request_id"] is not None:
+            payload["request_id"] = row["request_id"]
+        if row["site_id"] is not None:
+            payload["site_id"] = row["site_id"]
+        if row["grant_id"] is not None:
+            payload["grant_id"] = row["grant_id"]
+        if row["challenge_type"] != "profile":
+            payload["challenge_type"] = row["challenge_type"]
+        verify_signature(payload, signature, profile_row["public_key"])
+        connection.execute(
+            "UPDATE challenges SET used = 1 WHERE challenge_id = ?",
+            (challenge_id,),
+        )
+        self._write_audit_event(
+            connection,
+            "challenge.verified",
+            profile_id=profile_id,
+            site_id=row["site_id"],
+            request_id=row["request_id"],
+            grant_id=row["grant_id"],
+            challenge_id=challenge_id,
+            payload={"challenge_type": row["challenge_type"]},
+        )
         return True
